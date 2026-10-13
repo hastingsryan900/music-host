@@ -5,6 +5,7 @@ edition = "2021"
 description = "Music Host — a native, Apple Music–style player for your own music library"
 
 [dependencies]
+libc = "0.2"
 eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "persistence"] }
 egui = "0.31"
 rodio = { version = "0.20", default-features = false }

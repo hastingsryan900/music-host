@@ -360,6 +360,7 @@ pub enum NavIcon {
     Albums,
     Songs,
     Loved,
+    Stats,
     Playlist,
 }
 
@@ -399,6 +400,12 @@ pub fn nav_icon(ui: &Ui, icon: NavIcon, c: Pos2, color: Color32) {
         }
         NavIcon::Loved => {
             p.text(c + vec2(0.0, 0.5), Align2::CENTER_CENTER, "♥", font(14.0), color);
+        }
+        NavIcon::Stats => {
+            for (i, h) in [5.0, 9.0, 13.0].iter().enumerate() {
+                let x = c.x - 5.0 + i as f32 * 5.0;
+                p.rect_stroke(Rect::from_min_max(pos2(x - 1.6, c.y + 6.5 - h), pos2(x + 1.6, c.y + 6.5)), cr(1), Stroke::new(1.4f32, color), egui::StrokeKind::Middle);
+            }
         }
         NavIcon::Playlist => {
             for i in 0..3 {

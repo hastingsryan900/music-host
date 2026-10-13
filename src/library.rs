@@ -99,6 +99,31 @@ pub struct LibraryData {
     /// Even out loudness between songs (default on).
     #[serde(default)]
     pub level_volume: Option<bool>,
+    /// Seconds listened per local day (days since 1970-01-01).
+    #[serde(default)]
+    pub daily: BTreeMap<i64, f64>,
+}
+
+/// Today's local date as days since 1970-01-01.
+pub fn today() -> i64 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t: libc::time_t = now as libc::time_t;
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    (now + tm.tm_gmtoff as i64).div_euclid(86400)
+}
+
+/// (month 1-12, day 1-31) for days since 1970-01-01 (civil calendar).
+pub fn month_day(days: i64) -> (u32, u32) {
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (m, d)
 }
 
 pub struct Library {
@@ -186,6 +211,13 @@ impl Library {
 
     pub fn track(&self, id: TrackId) -> Option<&Track> {
         self.by_id.get(&id).map(|&i| &self.data.tracks[i])
+    }
+
+    pub fn log_listening(&mut self, secs: f64) {
+        if secs > 0.0 {
+            *self.data.daily.entry(today()).or_default() += secs;
+            self.dirty = true;
+        }
     }
 
     pub fn track_mut(&mut self, id: TrackId) -> Option<&mut Track> {
