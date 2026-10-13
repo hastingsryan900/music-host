@@ -27,6 +27,8 @@ pub enum Event {
     Failed { job: u64, title: String, error: String },
     /// Stopped by the user.
     Cancelled { job: u64, title: String },
+    /// Songs finished mid-job (album downloads): add them to the library now.
+    Imported { #[allow(dead_code)] job: u64, files: Vec<PathBuf> },
 }
 
 /// Set to true to stop a download (kills yt-dlp, removes partial files).
@@ -44,6 +46,9 @@ pub struct LibrarySnapshot {
     /// normalised "album|title" of every track (catches duplicates that a
     /// mismatched artist name would miss)
     pub album_songs: HashSet<String>,
+    /// Albums in the library: (norm artist, base album name, display title,
+    /// display artist, folder) — so downloads join the copy you have.
+    pub album_dirs: Vec<(String, String, String, String, PathBuf)>,
     /// normalised "albumartist|album" → display album name
     pub albums: Vec<(String, String, String)>,
 }
@@ -460,6 +465,25 @@ pub struct CatalogAlbum {
     pub tracks: Vec<CatalogTrack>,
     pub year: Option<u32>,
     pub genre: Option<String>,
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default)]
+    pub cover_url: Option<String>,
+}
+
+/// An album in an artist's catalogue (for the discography view).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CatalogAlbumRef {
+    pub id: u64,
+    pub title: String,
+    pub artist: String,
+    pub year: Option<u32>,
+    pub track_count: u32,
+    pub cover_url: Option<String>,
 }
 
 fn tracklist_cache(artist: &str, album: &str) -> PathBuf {
@@ -540,19 +564,23 @@ fn fetch_tracklist(artist: &str, album: &str) -> Option<CatalogAlbum> {
                 .clone()
         }
     };
-    let pick = &pick;
     let id = pick.get("collectionId")?.as_u64()?;
+    album_by_id(id)
+}
+
+/// Full album (tracks, year, genre, cover) by Apple catalogue id.
+pub fn album_by_id(id: u64) -> Option<CatalogAlbum> {
     let url = format!("https://itunes.apple.com/lookup?id={id}&entity=song&limit=200");
     let resp: Value = ureq::get(&url).timeout(Duration::from_secs(10)).call().ok()?.into_json().ok()?;
-    let mut tracks: Vec<CatalogTrack> = resp
-        .get("results")?
-        .as_array()?
+    let results = resp.get("results")?.as_array()?;
+    let coll = results.iter().find(|r| get_str(r, "wrapperType") == Some("collection"))?;
+    let mut tracks: Vec<CatalogTrack> = results
         .iter()
         .filter(|r| get_str(r, "wrapperType") == Some("track"))
         .filter_map(|r| {
             Some(CatalogTrack {
                 title: get_str(r, "trackName")?.to_string(),
-                artist: get_str(r, "artistName").unwrap_or(artist).to_string(),
+                artist: get_str(r, "artistName").unwrap_or("").to_string(),
                 track: r.get("trackNumber")?.as_u64()? as u32,
                 disc: r.get("discNumber").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
                 duration_ms: r.get("trackTimeMillis").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -565,9 +593,85 @@ fn fetch_tracklist(artist: &str, album: &str) -> Option<CatalogAlbum> {
     }
     Some(CatalogAlbum {
         tracks,
-        year: get_str(pick, "releaseDate").and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()),
-        genre: get_str(pick, "primaryGenreName").map(String::from),
+        year: get_str(coll, "releaseDate").and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()),
+        genre: get_str(coll, "primaryGenreName").map(String::from),
+        id: Some(id),
+        title: get_str(coll, "collectionName").unwrap_or("").to_string(),
+        artist: get_str(coll, "artistName").unwrap_or("").to_string(),
+        cover_url: get_str(coll, "artworkUrl100").map(|u| u.replace("100x100bb", "1500x1500bb")),
     })
+}
+
+/// "Modal Soul (Deluxe Edition) [Remastered]" → "modalsoul" for edition-proof matching.
+pub fn base_album(s: &str) -> String {
+    norm(s.split(['(', '[']).next().unwrap_or(s).trim_end_matches(" - EP").trim_end_matches(" - Single"))
+}
+
+/// An artist's albums and EPs on Apple's catalogue (cached for a week),
+/// one entry per release (deluxe/clean editions collapsed).
+pub fn artist_albums(artist: &str) -> Option<Vec<CatalogAlbumRef>> {
+    let cache = tracklist_cache(artist, "\u{0}discography");
+    if let Ok(meta) = std::fs::metadata(&cache) {
+        let fresh = meta.modified().ok().and_then(|m| m.elapsed().ok()).map(|e| e < Duration::from_secs(7 * 86400)).unwrap_or(false);
+        if fresh {
+            if let Ok(v) = serde_json::from_slice::<Option<Vec<CatalogAlbumRef>>>(&std::fs::read(&cache).ok()?) {
+                return v;
+            }
+        }
+    }
+    let found = fetch_artist_albums(artist);
+    if found.is_some() || fetch_reachable() {
+        let _ = std::fs::write(&cache, serde_json::to_vec(&found).unwrap_or_default());
+    }
+    found
+}
+
+fn fetch_artist_albums(artist: &str) -> Option<Vec<CatalogAlbumRef>> {
+    let url = format!("https://itunes.apple.com/search?term={}&entity=musicArtist&limit=5", url_encode(artist));
+    let resp: Value = ureq::get(&url).timeout(Duration::from_secs(10)).call().ok()?.into_json().ok()?;
+    let na = norm(artist);
+    let id = resp
+        .get("results")?
+        .as_array()?
+        .iter()
+        .find(|r| norm(get_str(r, "artistName").unwrap_or("")) == na)?
+        .get("artistId")?
+        .as_u64()?;
+    let url = format!("https://itunes.apple.com/lookup?id={id}&entity=album&limit=200");
+    let resp: Value = ureq::get(&url).timeout(Duration::from_secs(10)).call().ok()?.into_json().ok()?;
+    let mut by_base: std::collections::HashMap<String, CatalogAlbumRef> = Default::default();
+    for r in resp.get("results")?.as_array()? {
+        if get_str(r, "wrapperType") != Some("collection") {
+            continue;
+        }
+        let title = get_str(r, "collectionName").unwrap_or("").to_string();
+        let count = r.get("trackCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        // Skip singles (≤3 songs) and compilations by others.
+        if count <= 3 || norm(get_str(r, "artistName").unwrap_or("")) != na && !norm(get_str(r, "artistName").unwrap_or("")).contains(&na) {
+            continue;
+        }
+        let clean = get_str(r, "collectionExplicitness") == Some("cleaned");
+        let item = CatalogAlbumRef {
+            id: r.get("collectionId").and_then(|v| v.as_u64()).unwrap_or(0),
+            title: title.clone(),
+            artist: get_str(r, "artistName").unwrap_or(artist).to_string(),
+            year: get_str(r, "releaseDate").and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()),
+            track_count: count,
+            cover_url: get_str(r, "artworkUrl100").map(|u| u.replace("100x100bb", "600x600bb")),
+        };
+        let key = base_album(&title);
+        // Prefer the explicit / most complete edition of each release.
+        let better = match by_base.get(&key) {
+            None => true,
+            Some(old) => !clean && (count > old.track_count || old.title.len() > title.len() && count == old.track_count),
+        };
+        if better {
+            by_base.insert(key, item);
+        }
+    }
+    let mut v: Vec<CatalogAlbumRef> = by_base.into_values().collect();
+    v.sort_by_key(|a| std::cmp::Reverse(a.year.unwrap_or(0)));
+    Some(v)
 }
 
 /// Does a library song correspond to this catalogue track?
@@ -577,7 +681,7 @@ pub fn same_song(library_title: &str, catalog_title: &str) -> bool {
 }
 
 /// Everything needed to fetch one missing album track.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TrackRequest {
     pub track: CatalogTrack,
     pub album: String,
@@ -655,29 +759,16 @@ fn find_on_youtube(t: &CatalogTrack) -> Result<String, String> {
     }
 }
 
-/// Download one missing album track into its album. Blocking.
-pub fn download_track(job: u64, req: TrackRequest, tx: Sender<Event>, wake: egui::Context, cancel: Cancel) {
-    let send = |e: Event| {
-        let _ = tx.send(e);
-        wake.request_repaint();
-    };
-    let title = req.track.title.clone();
-    send(Event::Status { job, title: title.clone(), status: "Searching YouTube…".into(), progress: None });
-    if stopped(&cancel) {
-        return send(Event::Cancelled { job, title });
+/// Find a catalogue track on YouTube, download and tag it. Blocking.
+fn fetch_track(req: &TrackRequest, cancel: &Cancel, status: &dyn Fn(&str, Option<f32>)) -> Result<PathBuf, String> {
+    status("Searching YouTube…", None);
+    if stopped(cancel) {
+        return Err("stopped".into());
     }
-    let url = match find_on_youtube(&req.track) {
-        Ok(u) => u,
-        Err(e) => return send(Event::Failed { job, title, error: e }),
-    };
+    let url = find_on_youtube(&req.track)?;
     let stem = safe(&format!("{:02} {}", req.track.track, req.track.title));
     let _ = std::fs::create_dir_all(&req.dir);
-    let progress = |pct: Option<f32>| send(Event::Status { job, title: title.clone(), status: "Downloading".into(), progress: pct });
-    let path = match download_audio(&url, &req.dir, &stem, None, &progress, &cancel) {
-        Ok(p) => p,
-        Err(_) if stopped(&cancel) => return send(Event::Cancelled { job, title }),
-        Err(e) => return send(Event::Failed { job, title, error: e }),
-    };
+    let path = download_audio(&url, &req.dir, &stem, None, &|p| status("Downloading", p), cancel)?;
     let meta = Meta {
         artist: req.track.artist.clone(),
         title: req.track.title.clone(),
@@ -690,8 +781,267 @@ pub fn download_track(job: u64, req: TrackRequest, tx: Sender<Event>, wake: egui
         ..Default::default()
     };
     let _ = write_tags(&path, &meta, &meta.title, meta.track);
-    send(Event::Added { job, title: title.clone(), summary: format!("“{title}” added to {}", req.album), files: vec![path] });
+    Ok(path)
 }
+
+/// Download one missing album track into its album. Blocking.
+pub fn download_track(job: u64, req: TrackRequest, tx: Sender<Event>, wake: egui::Context, cancel: Cancel) {
+    let send = |e: Event| {
+        let _ = tx.send(e);
+        wake.request_repaint();
+    };
+    let title = req.track.title.clone();
+    let status = |s: &str, p: Option<f32>| send(Event::Status { job, title: title.clone(), status: s.into(), progress: p });
+    match fetch_track(&req, &cancel, &status) {
+        Ok(path) => send(Event::Added { job, title: title.clone(), summary: format!("“{title}” added to {}", req.album), files: vec![path] }),
+        Err(_) if stopped(&cancel) => send(Event::Cancelled { job, title }),
+        Err(e) => send(Event::Failed { job, title, error: e }),
+    }
+}
+
+/// Download a whole catalogue album (or the listed subset) as one job.
+/// Songs appear in the library as each one finishes.
+pub fn download_album(job: u64, album: CatalogAlbum, dir: PathBuf, skip: HashSet<String>, tx: Sender<Event>, wake: egui::Context, cancel: Cancel) {
+    let send = |e: Event| {
+        let _ = tx.send(e);
+        wake.request_repaint();
+    };
+    let label = format!("{} — {}", album.title, album.artist);
+    let todo: Vec<&CatalogTrack> = album.tracks.iter().filter(|t| !skip.contains(&norm(&without_feat(&t.title)))).collect();
+    if todo.is_empty() {
+        return send(Event::Skipped { job, title: label, summary: format!("You already have all of {}", album.title) });
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    // Real cover first, so the album looks right as songs arrive.
+    if let Some(bytes) = album.cover_url.as_deref().and_then(fetch) {
+        let dest = dir.join("cover.jpg");
+        if !dest.exists() && image::load_from_memory(&bytes).is_ok() {
+            let _ = std::fs::write(dest, bytes);
+        }
+    }
+    let total = todo.len();
+    let (mut got, mut failed) = (vec![], vec![]);
+    for (i, t) in todo.into_iter().enumerate() {
+        if stopped(&cancel) {
+            break;
+        }
+        let req = TrackRequest {
+            track: t.clone(),
+            album: album.title.clone(),
+            album_artist: album.artist.clone(),
+            year: album.year,
+            genre: album.genre.clone(),
+            dir: dir.clone(),
+        };
+        let status = |s: &str, p: Option<f32>| {
+            send(Event::Status { job, title: label.clone(), status: format!("{}/{} · {} · {s}", i + 1, total, t.title), progress: p })
+        };
+        match fetch_track(&req, &cancel, &status) {
+            Ok(path) => {
+                send(Event::Imported { job, files: vec![path.clone()] });
+                got.push(path);
+            }
+            Err(_) if stopped(&cancel) => break,
+            Err(e) => failed.push(format!("{} ({e})", t.title)),
+        }
+    }
+    if stopped(&cancel) && got.is_empty() {
+        return send(Event::Cancelled { job, title: label });
+    }
+    let mut summary = format!("{} of {} songs added to {}", got.len(), total, album.title);
+    if stopped(&cancel) {
+        summary = format!("Stopped — {summary}");
+    }
+    if !failed.is_empty() {
+        summary.push_str(&format!(" · couldn't find: {}", failed.join(", ")));
+    }
+    if got.is_empty() {
+        send(Event::Failed { job, title: label, error: summary })
+    } else {
+        send(Event::Added { job, title: label, summary, files: got })
+    }
+}
+
+/// If the library already has this album, use its exact name/artist and
+/// folder, and skip the songs it already contains.
+pub fn fit_to_library(album: &mut CatalogAlbum, root: &Path, lib: &LibrarySnapshot) -> (PathBuf, HashSet<String>) {
+    let (na, nb) = (norm(&album.artist), base_album(&album.title));
+    if let Some((_, _, title, artist, dir)) = lib
+        .album_dirs
+        .iter()
+        .find(|(a, b, _, _, _)| *b == nb && (a.contains(&na) || na.contains(a.as_str()) || na == "variousartists"))
+    {
+        album.title = title.clone();
+        album.artist = artist.clone();
+        let have: HashSet<String> = album
+            .tracks
+            .iter()
+            .filter(|t| lib.album_songs.contains(&format!("{}|{}", norm(title), norm(&without_feat(&t.title)))))
+            .map(|t| norm(&without_feat(&t.title)))
+            .collect();
+        return (dir.clone(), have);
+    }
+    (root.join("YouTube").join(safe(&format!("{} - {}", album.artist, album.title))), HashSet::new())
+}
+
+/// Apple Music / Spotify link → download that album (or song) from YouTube.
+pub fn run_catalog(job: u64, url: String, root: PathBuf, lib: LibrarySnapshot, tx: Sender<Event>, wake: egui::Context, cancel: Cancel) {
+    let send = |e: Event| {
+        let _ = tx.send(e);
+        wake.request_repaint();
+    };
+    send(Event::Status { job, title: url.clone(), status: "Reading link…".into(), progress: None });
+    let (mut album, only) = match resolve_catalog_link(&url) {
+        Ok(CatalogLink::Album(a)) => (a, None),
+        Ok(CatalogLink::Song(a, t)) => (a, Some(t)),
+        Err(e) => return send(Event::Failed { job, title: url, error: e }),
+    };
+    if let Some(t) = &only {
+        album.tracks.retain(|c| same_song(t, &c.title));
+        if album.tracks.is_empty() {
+            return send(Event::Failed { job, title: t.clone(), error: "song not found on its album".into() });
+        }
+    }
+    let (dir, skip) = fit_to_library(&mut album, &root, &lib);
+    download_album(job, album, dir, skip, tx, wake, cancel);
+}
+
+/// Album from an artist's discography (by catalogue id) → download it.
+pub fn run_catalog_album(job: u64, id: u64, root: PathBuf, lib: LibrarySnapshot, tx: Sender<Event>, wake: egui::Context, cancel: Cancel) {
+    let send = |e: Event| {
+        let _ = tx.send(e);
+        wake.request_repaint();
+    };
+    send(Event::Status { job, title: "Album".into(), status: "Getting tracklist…".into(), progress: None });
+    let Some(mut album) = album_by_id(id) else {
+        return send(Event::Failed { job, title: "Album".into(), error: "couldn't load the tracklist".into() });
+    };
+    let (dir, skip) = fit_to_library(&mut album, &root, &lib);
+    download_album(job, album, dir, skip, tx, wake, cancel);
+}
+
+// ---------------------------------------------------------------- Apple Music / Spotify links
+
+/// What an Apple Music / Spotify link points at.
+pub enum CatalogLink {
+    Album(CatalogAlbum),
+    /// One song: the album it's on, plus that song's title.
+    Song(CatalogAlbum, String),
+}
+
+pub fn is_catalog_link(url: &str) -> bool {
+    url.contains("music.apple.com/") || url.contains("open.spotify.com/")
+}
+
+/// Resolve an Apple Music or Spotify album/song link to Apple's catalogue.
+pub fn resolve_catalog_link(url: &str) -> Result<CatalogLink, String> {
+    if url.contains("music.apple.com/") {
+        // …/album/<name>/<albumId>?i=<songId>
+        let path = url.split('?').next().unwrap_or(url);
+        let album_id = path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .find_map(|seg| seg.parse::<u64>().ok())
+            .ok_or("couldn't read that Apple Music link")?;
+        let album = album_by_id(album_id).ok_or("album not found on Apple Music")?;
+        let song = url.split(['?', '&']).find_map(|kv| kv.strip_prefix("i=")).and_then(|id| id.parse::<u64>().ok());
+        if let Some(song_id) = song {
+            let r: Value = ureq::get(&format!("https://itunes.apple.com/lookup?id={song_id}"))
+                .timeout(Duration::from_secs(10))
+                .call()
+                .ok()
+                .and_then(|r| r.into_json().ok())
+                .ok_or("song not found")?;
+            let title = r.get("results").and_then(|a| a.as_array()).and_then(|a| a.first()).and_then(|t| get_str(t, "trackName")).ok_or("song not found")?;
+            return Ok(CatalogLink::Song(album, title.to_string()));
+        }
+        return Ok(CatalogLink::Album(album));
+    }
+    // Spotify: read the public embed page (no account needed).
+    if url.contains("/playlist/") {
+        return Err("Spotify playlists aren't supported — use an album or song link".into());
+    }
+    let (kind, id) = spotify_kind_id(url).ok_or("couldn't read that Spotify link")?;
+    let e = spotify_embed(kind, &id)?;
+    let name = get_str(&e, "name").or(get_str(&e, "title")).unwrap_or("").to_string();
+    let artists: Vec<String> = e
+        .get("artists")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|x| get_str(x, "name").map(String::from)).collect())
+        .unwrap_or_default();
+    let artist = artists.first().cloned().or_else(|| get_str(&e, "subtitle").map(|s| s.split(',').next().unwrap_or(s).replace('\u{a0}', " ").trim().to_string())).unwrap_or_default();
+    if kind == "track" {
+        // Which album is it on? Ask Apple's catalogue.
+        let m = itunes_song(&artist, &name, None, &LibrarySnapshot::default()).ok_or_else(|| format!("couldn't find “{name}” by {artist}"))?;
+        let album = fetch_tracklist(&m.album_artist, &m.album).ok_or_else(|| format!("couldn't find the album for “{name}”"))?;
+        return Ok(CatalogLink::Song(album, name));
+    }
+    // Album: prefer Apple's copy (disc numbers, year, genre, HD cover);
+    // otherwise use Spotify's own tracklist.
+    if let Some(a) = fetch_tracklist(&artist, &name) {
+        return Ok(CatalogLink::Album(a));
+    }
+    let tracks: Vec<CatalogTrack> = e
+        .get("trackList")
+        .and_then(|t| t.as_array())
+        .map(|t| {
+            t.iter()
+                .enumerate()
+                .filter_map(|(i, x)| {
+                    Some(CatalogTrack {
+                        title: get_str(x, "title")?.to_string(),
+                        artist: get_str(x, "subtitle").unwrap_or(&artist).split(',').next().unwrap_or(&artist).replace('\u{a0}', " ").trim().to_string(),
+                        track: i as u32 + 1,
+                        disc: 1,
+                        duration_ms: x.get("duration").and_then(|d| d.as_u64()).unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if tracks.is_empty() {
+        return Err("that Spotify album has no tracks".into());
+    }
+    let cover_url = e
+        .get("visualIdentity")
+        .and_then(|v| v.get("image"))
+        .and_then(|i| i.as_array())
+        .and_then(|imgs| imgs.iter().max_by_key(|i| i.get("maxWidth").and_then(|w| w.as_u64()).unwrap_or(0)))
+        .and_then(|i| get_str(i, "url"))
+        .map(String::from);
+    let year = get_str(&e, "releaseDate").and_then(|d| d.get(..4)).and_then(|y| y.parse().ok());
+    Ok(CatalogLink::Album(CatalogAlbum { tracks, year, genre: None, id: None, title: name, artist, cover_url }))
+}
+
+/// "https://open.spotify.com/intl-de/album/<id>?si=…" → ("album", id)
+fn spotify_kind_id(url: &str) -> Option<(&'static str, String)> {
+    let path = url.split('?').next()?;
+    let segs: Vec<&str> = path.split('/').collect();
+    for (i, seg) in segs.iter().enumerate() {
+        for kind in ["album", "track"] {
+            if *seg == kind {
+                return segs.get(i + 1).map(|id| (kind, id.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn spotify_embed(kind: &str, id: &str) -> Result<Value, String> {
+    let html = ureq::get(&format!("https://open.spotify.com/embed/{kind}/{id}"))
+        .set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+        .timeout(Duration::from_secs(10))
+        .call()
+        .map_err(|e| format!("couldn't open the Spotify link ({e})"))?
+        .into_string()
+        .map_err(|e| e.to_string())?;
+    let start = html.find(r#"<script id="__NEXT_DATA__" type="application/json">"#).ok_or("couldn't read the Spotify page")?;
+    let json_start = html[start..].find('>').map(|i| start + i + 1).ok_or("couldn't read the Spotify page")?;
+    let json_end = html[json_start..].find("</script>").map(|i| json_start + i).ok_or("couldn't read the Spotify page")?;
+    let v: Value = serde_json::from_str(&html[json_start..json_end]).map_err(|e| e.to_string())?;
+    v.pointer("/props/pageProps/state/data/entity").cloned().ok_or_else(|| "couldn't read the Spotify page".into())
+}
+
 
 /// Expand a link into individual video infos (playlists → entries).
 /// Is this a link to a real playlist/album (vs. a single video that
@@ -902,6 +1252,31 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(&dir).map(|rd| rd.flatten().map(|e| e.file_name()).collect()).unwrap_or_default();
         println!("cancel → {:?} after {:.1}s, files left: {:?}", r.as_ref().err(), t.elapsed().as_secs_f32(), left);
         assert!(r.is_err() && left.is_empty());
+    }
+
+    /// MH_CAT=1 [MH_SPOTIFY=<album url>] cargo test catalog_live -- --nocapture
+    #[test]
+    fn catalog_live() {
+        if std::env::var("MH_CAT").is_err() {
+            return;
+        }
+        let d = artist_albums("Nujabes").unwrap();
+        println!("Nujabes discography ({}): {:?}", d.len(), d.iter().map(|a| format!("{} ({:?}, {} songs)", a.title, a.year, a.track_count)).collect::<Vec<_>>());
+        if let Some(first) = d.first() {
+            let url = format!("https://music.apple.com/us/album/x/{}", first.id);
+            match resolve_catalog_link(&url) {
+                Ok(CatalogLink::Album(a)) => println!("apple link → {} by {}: {} tracks, cover {:?}", a.title, a.artist, a.tracks.len(), a.cover_url.is_some()),
+                Ok(CatalogLink::Song(a, t)) => println!("apple link → song {t} on {}", a.title),
+                Err(e) => println!("apple link error: {e}"),
+            }
+        }
+        if let Ok(sp) = std::env::var("MH_SPOTIFY") {
+            match resolve_catalog_link(&sp) {
+                Ok(CatalogLink::Album(a)) => println!("spotify → album {} by {}: {} tracks", a.title, a.artist, a.tracks.len()),
+                Ok(CatalogLink::Song(a, t)) => println!("spotify → song {t} on {} ({} tracks)", a.title, a.tracks.len()),
+                Err(e) => println!("spotify error: {e}"),
+            }
+        }
     }
 
     #[test]

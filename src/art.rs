@@ -11,6 +11,7 @@ use crate::library::{app_dir, find_artwork, AlbumKey};
 use egui::{Color32, ColorImage, Context, TextureHandle, TextureId, TextureOptions};
 use image::DynamicImage;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -41,6 +42,8 @@ struct Job {
     artist: String,
     album: String,
     hd: bool,
+    /// Remote cover (catalogue albums you don't own yet).
+    url: Option<String>,
 }
 
 enum Done {
@@ -143,8 +146,25 @@ fn needs_upgrade(job: &Job) -> bool {
     !cache_path(&job.key).exists() && !known_miss(&job.key)
 }
 
+/// A remote cover, cached on disk after the first download.
+fn remote(url: &str) -> Option<DynamicImage> {
+    let path = cache_dir().join(format!("remote-{}.jpg", hash(url)));
+    if let Ok(img) = image::open(&path) {
+        return Some(img);
+    }
+    let mut bytes = vec![];
+    let reader = ureq::get(url).timeout(Duration::from_secs(15)).call().ok()?.into_reader();
+    std::io::Read::take(reader, 10 * 1024 * 1024).read_to_end(&mut bytes).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let _ = std::fs::write(&path, &bytes);
+    Some(img)
+}
+
 fn thumb(job: &Job) -> Option<(ColorImage, ColorImage, Color32)> {
-    let img = best_local(job)?;
+    let img = match &job.url {
+        Some(u) => remote(u)?,
+        None => best_local(job)?,
+    };
     let small = img.resize(THUMB, THUMB, image::imageops::FilterType::Lanczos3);
     let rgba = small.to_rgba8();
     // Average colour drives the accent + page tint.
@@ -412,7 +432,22 @@ impl ArtCache {
             artist: artist.to_string(),
             album: album.to_string(),
             hd,
+            url: None,
         }
+    }
+
+    /// Cover art from a URL (e.g. albums you don't own yet).
+    pub fn get_url(&mut self, url: &str) -> &Art {
+        let key = format!("url:{url}");
+        if !self.map.contains_key(&key) {
+            self.map.insert(key.clone(), Art::Loading);
+            let mut job = Self::job(&key, Path::new(""), "", "", false);
+            job.url = Some(url.to_string());
+            let (lock, cv) = &*self.queue;
+            lock.lock().unwrap().push_back(job);
+            cv.notify_one();
+        }
+        &self.map[&key]
     }
 
     /// Thumbnail-sized art for grids and lists.

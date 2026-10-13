@@ -72,6 +72,30 @@ enum Action {
     StopDownload(Option<u64>),
     ClearFinishedDownloads,
     SetLevelVolume(bool),
+    /// Look up an artist's full discography.
+    FetchDiscography(String),
+    /// Download a whole album from an artist's discography.
+    DownloadCatalogAlbum(crate::ytdl::CatalogAlbumRef),
+}
+
+/// Discography lookup state for an artist.
+pub enum Disco {
+    Loading,
+    Ready(Option<Vec<crate::ytdl::CatalogAlbumRef>>),
+}
+
+/// A download that hasn't finished — saved so it picks up after a restart.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub enum Pending {
+    Link(String),
+    /// Catalogue album id, display title.
+    Album(u64, String),
+    /// Album key, the missing song.
+    Track(String, crate::ytdl::TrackRequest),
+}
+
+fn pending_path() -> PathBuf {
+    library::app_dir().join("downloads.json")
 }
 
 /// Full tracklist lookup state for an album.
@@ -136,6 +160,9 @@ struct V<'a> {
     tracklists: &'a HashMap<String, Tracklist>,
     /// (album key, normalised title) → download job
     track_jobs: &'a HashMap<(String, String), u64>,
+    discos: &'a HashMap<String, Disco>,
+    /// catalogue album id → download job
+    album_jobs: &'a HashMap<u64, u64>,
 }
 
 pub struct App {
@@ -188,6 +215,12 @@ pub struct App {
     loud_tx: std::sync::mpsc::Sender<(TrackId, PathBuf)>,
     loud_rx: Receiver<(TrackId, Option<(f32, f32)>)>,
     loud_pending: std::collections::HashSet<TrackId>,
+    discos: HashMap<String, Disco>,
+    disco_tx: std::sync::mpsc::Sender<(String, Option<Vec<crate::ytdl::CatalogAlbumRef>>)>,
+    disco_rx: Receiver<(String, Option<Vec<crate::ytdl::CatalogAlbumRef>>)>,
+    album_jobs: HashMap<u64, u64>,
+    /// Unfinished downloads by job id (persisted to downloads.json).
+    pending: std::collections::BTreeMap<u64, Pending>,
 }
 
 impl App {
@@ -198,6 +231,7 @@ impl App {
         let d = DEFAULT_ACCENT;
         let (yt_tx, yt_rx) = channel();
         let (tl_tx, tl_rx) = channel();
+        let (disco_tx, disco_rx) = channel();
         // One worker measures loudness, a song at a time.
         let (loud_tx, loud_jobs) = channel::<(TrackId, PathBuf)>();
         let (loud_res_tx, loud_rx) = channel();
@@ -259,6 +293,11 @@ impl App {
             loud_tx,
             loud_rx,
             loud_pending: Default::default(),
+            discos: HashMap::new(),
+            disco_tx,
+            disco_rx,
+            album_jobs: HashMap::new(),
+            pending: Default::default(),
             xmb: cc.gl.as_ref().and_then(|gl| match crate::xmb::Xmb::new(gl) {
                 Ok(x) => Some(Arc::new(Mutex::new(x))),
                 Err(e) => {
@@ -267,6 +306,15 @@ impl App {
                 }
             }),
         };
+        // Pick up downloads that were still running when the app closed.
+        if std::env::var("MH_SCREENSHOT").is_err() {
+            let saved: Vec<Pending> = std::fs::read(pending_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            if !saved.is_empty() {
+                let n = saved.len();
+                app.dispatch(&cc.egui_ctx, saved);
+                app.toast(&cc.egui_ctx, format!("Resuming {n} download{}", if n == 1 { "" } else { "s" }));
+            }
+        }
         // Dev helpers for screenshots.
         if let Ok(v) = std::env::var("MH_VIEW") {
             app.view = match v.as_str() {
@@ -275,6 +323,10 @@ impl App {
                 "now" => View::NowPlaying,
                 "artists" => View::Artists(app.lib.artists.keys().next().cloned()),
                 "album" => app.lib.albums.first().map(|a| View::Album(a.key.clone())).unwrap_or(View::Albums),
+                v if v.starts_with("artist:") => {
+                    let q = v[7..].to_lowercase();
+                    View::Artists(app.lib.artists.keys().find(|a| a.to_lowercase().contains(&q)).cloned())
+                }
                 v if v.starts_with("album:") => {
                     let q = v[6..].to_lowercase();
                     app.lib.albums.iter().find(|a| a.title.to_lowercase().contains(&q)).map(|a| View::Album(a.key.clone())).unwrap_or(View::Albums)
@@ -545,6 +597,24 @@ impl App {
                     self.player.play_next(id);
                     self.player.next(&self.lib);
                 }
+                Action::FetchDiscography(artist) => {
+                    if !self.discos.contains_key(&artist) {
+                        self.discos.insert(artist.clone(), Disco::Loading);
+                        let (tx, wake) = (self.disco_tx.clone(), ctx.clone());
+                        std::thread::spawn(move || {
+                            let d = crate::ytdl::artist_albums(&artist);
+                            let _ = tx.send((artist, d));
+                            wake.request_repaint();
+                        });
+                    }
+                }
+                Action::DownloadCatalogAlbum(r) => {
+                    let busy = self.album_jobs.get(&r.id).map(|id| self.jobs.iter().any(|j| j.id == *id && !j.done)).unwrap_or(false);
+                    if !busy {
+                        self.toast(ctx, format!("Getting “{}” from YouTube…", r.title));
+                        self.dispatch(ctx, vec![Pending::Album(r.id, r.title)]);
+                    }
+                }
             }
         }
     }
@@ -557,10 +627,15 @@ impl App {
             .map(String::from)
             .collect();
         if urls.is_empty() {
-            self.toast(ctx, "Paste a YouTube link".into());
+            self.toast(ctx, "Paste a YouTube, Apple Music or Spotify link".into());
             return;
         }
-        // Downloads go into the main library folder (under "YouTube/").
+        self.dispatch(ctx, urls.into_iter().map(Pending::Link).collect());
+        self.st.link_text.clear();
+    }
+
+    /// Where new downloads go: the main library folder (under "YouTube/").
+    fn download_root(&mut self) -> PathBuf {
         let root = self
             .lib
             .data
@@ -574,17 +649,66 @@ impl App {
             self.lib.data.folders.push(root.clone());
             self.lib.mark_dirty();
         }
-        let snapshot = self.library_snapshot();
-        for url in urls {
+        root
+    }
+
+    /// Start downloads: each gets a row in the downloads window and is
+    /// remembered until it finishes, so a restart picks it back up.
+    fn dispatch(&mut self, ctx: &Context, specs: Vec<Pending>) {
+        use crate::ytdl;
+        let root = self.download_root();
+        let snap = self.library_snapshot();
+        let mut tracks = vec![];
+        for spec in specs {
             let id = self.next_job;
             self.next_job += 1;
-            let job = LinkJob::new(id, url.clone());
+            let title = match &spec {
+                Pending::Link(u) => u.clone(),
+                Pending::Album(_, t) => t.clone(),
+                Pending::Track(_, r) => r.track.title.clone(),
+            };
+            let job = LinkJob::new(id, title);
             let cancel = job.cancel.clone();
             self.jobs.insert(0, job);
-            let (tx, root, snap, wake) = (self.yt_tx.clone(), root.clone(), snapshot.clone(), ctx.clone());
-            std::thread::spawn(move || crate::ytdl::run(id, url, root, snap, tx, wake, cancel));
+            self.pending.insert(id, spec.clone());
+            let (tx, root, snap, wake) = (self.yt_tx.clone(), root.clone(), snap.clone(), ctx.clone());
+            match spec {
+                Pending::Link(url) => {
+                    std::thread::spawn(move || {
+                        if ytdl::is_catalog_link(&url) {
+                            ytdl::run_catalog(id, url, root, snap, tx, wake, cancel)
+                        } else {
+                            ytdl::run(id, url, root, snap, tx, wake, cancel)
+                        }
+                    });
+                }
+                Pending::Album(aid, _) => {
+                    self.album_jobs.insert(aid, id);
+                    std::thread::spawn(move || ytdl::run_catalog_album(id, aid, root, snap, tx, wake, cancel));
+                }
+                Pending::Track(key, req) => {
+                    self.track_jobs.insert((key, ytdl::norm(&req.track.title)), id);
+                    tracks.push((id, cancel, req));
+                }
+            }
         }
-        self.st.link_text.clear();
+        if !tracks.is_empty() {
+            let (tx, wake) = (self.yt_tx.clone(), ctx.clone());
+            // One at a time: gentler on YouTube, and progress reads naturally.
+            std::thread::spawn(move || {
+                for (id, cancel, req) in tracks {
+                    ytdl::download_track(id, req, tx.clone(), wake.clone(), cancel);
+                }
+            });
+        }
+        self.save_pending();
+    }
+
+    fn save_pending(&self) {
+        let list: Vec<&Pending> = self.pending.values().collect();
+        if let Ok(b) = serde_json::to_vec_pretty(&list) {
+            let _ = std::fs::write(pending_path(), b);
+        }
     }
 
     fn library_snapshot(&self) -> crate::ytdl::LibrarySnapshot {
@@ -598,6 +722,9 @@ impl App {
         }
         for a in &self.lib.albums {
             snap.albums.push((norm(&a.artist), norm(&a.title), a.title.clone()));
+            if let Some(dir) = a.tracks.first().and_then(|id| self.lib.track(*id)).and_then(|t| t.path.parent()) {
+                snap.album_dirs.push((norm(&a.artist), crate::ytdl::base_album(&a.title), a.title.clone(), a.artist.clone(), dir.to_path_buf()));
+            }
             for id in &a.tracks {
                 if let Some(t) = self.lib.track(*id) {
                     snap.album_songs.insert(format!("{}|{}", norm(&a.title), norm(&without_feat(&t.title))));
@@ -629,15 +756,8 @@ impl App {
                     continue;
                 }
             }
-            let id = self.next_job;
-            self.next_job += 1;
-            let job = LinkJob::new(id, t.title.clone());
-            let cancel = job.cancel.clone();
-            self.jobs.insert(0, job);
-            self.track_jobs.insert(nk, id);
-            reqs.push((
-                id,
-                cancel,
+            reqs.push(Pending::Track(
+                key.to_string(),
                 crate::ytdl::TrackRequest {
                     track: t,
                     album: album.title.clone(),
@@ -653,13 +773,7 @@ impl App {
         }
         let n = reqs.len();
         self.toast(ctx, format!("Finding {n} song{} on YouTube…", if n == 1 { "" } else { "s" }));
-        let (tx, wake) = (self.yt_tx.clone(), ctx.clone());
-        // One at a time: gentler on YouTube, and progress reads naturally.
-        std::thread::spawn(move || {
-            for (id, cancel, req) in reqs {
-                crate::ytdl::download_track(id, req, tx.clone(), wake.clone(), cancel);
-            }
-        });
+        self.dispatch(ctx, reqs);
     }
 
     fn pump_links(&mut self, ctx: &Context) {
@@ -667,7 +781,17 @@ impl App {
         while let Ok((key, tl)) = self.tl_rx.try_recv() {
             self.tracklists.insert(key, Tracklist::Ready(tl));
         }
+        while let Ok((artist, d)) = self.disco_rx.try_recv() {
+            self.discos.insert(artist, Disco::Ready(d));
+        }
+        let before = self.pending.len();
         while let Ok(e) = self.yt_rx.try_recv() {
+            match &e {
+                Event::Added { job, .. } | Event::Skipped { job, .. } | Event::Failed { job, .. } | Event::Cancelled { job, .. } => {
+                    self.pending.remove(job);
+                }
+                _ => {}
+            }
             match e {
                 Event::Status { job, title, status, progress } => {
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == job) {
@@ -694,6 +818,7 @@ impl App {
                     }
                     self.toast(ctx, summary.lines().next().unwrap_or("Nothing new").to_string());
                 }
+                Event::Imported { files, .. } => self.start_scan(ctx, files),
                 Event::Cancelled { job, title } => {
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == job) {
                         if j.title.starts_with("http") {
@@ -715,6 +840,9 @@ impl App {
                     self.toast(ctx, format!("Download failed: {error}"));
                 }
             }
+        }
+        if self.pending.len() != before {
+            self.save_pending();
         }
     }
 
@@ -1016,6 +1144,8 @@ impl eframe::App for App {
             jobs: &self.jobs,
             tracklists: &self.tracklists,
             track_jobs: &self.track_jobs,
+            discos: &self.discos,
+            album_jobs: &self.album_jobs,
         };
         v.player_bar(ctx, self.track_at);
         v.sidebar(ctx, self.scan_progress, !self.history.is_empty());
@@ -1869,11 +1999,11 @@ impl<'a> V<'a> {
             View::RecentlyAdded => {
                 let mut albums: Vec<usize> = (0..self.lib.albums.len()).collect();
                 albums.sort_by_key(|&i| std::cmp::Reverse(self.lib.albums[i].added_at));
-                self.album_grid(ui, "Recently Added", &albums, None);
+                self.album_grid(ui, "Recently Added", &albums, None, &[]);
             }
             View::Albums => {
                 let albums: Vec<usize> = (0..self.lib.albums.len()).collect();
-                self.album_grid(ui, "Albums", &albums, None);
+                self.album_grid(ui, "Albums", &albums, None, &[]);
             }
             View::Artists(sel) => self.artists(ui, sel),
             View::Songs => {
@@ -1923,7 +2053,7 @@ impl<'a> V<'a> {
         ui.ctx().request_repaint_after(Duration::from_millis(33));
     }
 
-    fn album_grid(&mut self, ui: &mut Ui, title: &str, albums: &[usize], header: Option<&dyn Fn(&mut Ui)>) {
+    fn album_grid(&mut self, ui: &mut Ui, title: &str, albums: &[usize], header: Option<&dyn Fn(&mut Ui)>, missing: &[crate::ytdl::CatalogAlbumRef]) {
         let width = ui.available_width() - PAD * 2.0;
         let min_tile = 172.0;
         let cols = (((width + TILE_GAP) / (min_tile + TILE_GAP)).floor() as usize).max(1);
@@ -1932,8 +2062,16 @@ impl<'a> V<'a> {
         let rows = albums.len().div_ceil(cols);
         let title_h = if header.is_some() { 128.0 } else { 80.0 };
         let since = (self.now - self.view_at) as f32;
-        egui::ScrollArea::vertical().auto_shrink(false).id_salt(("grid", title)).show_viewport(ui, |ui, viewport| {
-            let total_h = title_h + rows as f32 * row_h + 40.0;
+        let mut sa = egui::ScrollArea::vertical().auto_shrink(false).id_salt(("grid", title));
+        if let Some(off) = std::env::var("MH_SCROLL").ok().and_then(|v| v.parse::<f32>().ok()) {
+            sa = sa.vertical_scroll_offset(off);
+        }
+        sa.show_viewport(ui, |ui, viewport| {
+            // "More by…" section: catalogue albums you don't have yet.
+            let more_y = title_h + rows as f32 * row_h + 24.0;
+            let more_rows = missing.len().div_ceil(cols);
+            let more_h = if missing.is_empty() { 0.0 } else { 64.0 + more_rows as f32 * row_h };
+            let total_h = title_h + rows as f32 * row_h + 40.0 + more_h;
             let (full, _) = ui.allocate_exact_size(vec2(ui.available_width(), total_h), Sense::hover());
             let origin = full.min;
             ui.painter().text(origin + vec2(PAD, 22.0), Align2::LEFT_TOP, title, bold(30.0), TEXT);
@@ -1959,7 +2097,96 @@ impl<'a> V<'a> {
                     }
                 }
             }
+            if !missing.is_empty() {
+                let y = origin.y + more_y;
+                ui.painter().text(pos2(origin.x + PAD, y), Align2::LEFT_TOP, format!("More by {title}"), bold(20.0), TEXT);
+                ui.painter().text(pos2(origin.x + PAD, y + 28.0), Align2::LEFT_TOP, "Not in your library — click one to download it from YouTube", font(13.0), FAINT);
+                for (i, r) in missing.iter().enumerate() {
+                    let (row, c) = (i / cols, i % cols);
+                    let top = more_y + 64.0 + row as f32 * row_h;
+                    if top > viewport.bottom() || top + row_h < viewport.top() {
+                        continue;
+                    }
+                    let rect = Rect::from_min_size(origin + vec2(PAD + c as f32 * (tile + TILE_GAP), top), vec2(tile, tile));
+                    let mut cui = ui.new_child(egui::UiBuilder::new().id_salt(("mtile", r.id)).max_rect(rect.expand2(vec2(16.0, 70.0))));
+                    self.missing_tile(&mut cui, r, rect);
+                }
+            }
         });
+    }
+
+    /// A greyed-out album you don't own; click to download the whole thing.
+    fn missing_tile(&mut self, ui: &mut Ui, r: &crate::ytdl::CatalogAlbumRef, art: Rect) {
+        let job = self.album_jobs.get(&r.id).and_then(|id| self.jobs.iter().find(|j| j.id == *id));
+        let busy = job.map(|j| !j.done).unwrap_or(false);
+        let resp = ui.interact(art, Id::new(("mtile", r.id)), Sense::click());
+        let h = anim(ui, resp.id, resp.hovered() && !busy, 0.2);
+        let grown = art.expand(art.width() * 0.02 * h);
+        // Dimmed, like the missing songs on an album page.
+        let shade = Color32::from_gray((95.0 + 85.0 * h) as u8);
+        let mut drawn = false;
+        if let Some(url) = &r.cover_url {
+            match self.art.get_url(url) {
+                Art::Ready { tex, .. } => {
+                    egui::Image::new((tex.id(), grown.size())).corner_radius(cr(10)).tint(shade).paint_at(ui, grown);
+                    drawn = true;
+                }
+                Art::Loading => {
+                    placeholder(ui, grown, 10, &r.title, true);
+                    drawn = true;
+                }
+                Art::Missing => {}
+            }
+        }
+        if !drawn {
+            placeholder(ui, grown, 10, &r.title, false);
+        }
+        ui.painter().rect_stroke(grown, cr(10), Stroke::new(1.0_f32, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
+        let center = grown.center();
+        match job {
+            Some(j) if !j.done => {
+                ui.painter().rect_filled(grown, cr(10), Color32::from_black_alpha(110));
+                let label = match j.progress {
+                    Some(p) => format!("{:.0}%", p * 100.0),
+                    None => "Finding songs…".into(),
+                };
+                ui.painter().text(center - vec2(0.0, 10.0), Align2::CENTER_CENTER, label, bold(15.0), Color32::WHITE);
+                ui.painter().text(center + vec2(0.0, 12.0), Align2::CENTER_CENTER, &j.status, font(11.5), DIM);
+                if let Some(p) = j.progress {
+                    let bar = Rect::from_min_max(pos2(grown.left() + 14.0, grown.bottom() - 14.0), pos2(grown.right() - 14.0, grown.bottom() - 11.0));
+                    ui.painter().rect_filled(bar, cr(2), Color32::from_white_alpha(30));
+                    let mut f = bar;
+                    f.set_right(bar.left() + bar.width() * p);
+                    ui.painter().rect_filled(f, cr(2), accent());
+                }
+                ui.ctx().request_repaint_after(Duration::from_millis(150));
+            }
+            Some(j) if j.failed => {
+                ui.painter().text(center, Align2::CENTER_CENTER, "⚠ Try again", bold(13.0), Color32::from_rgb(255, 140, 120));
+            }
+            _ => {
+                if h > 0.001 {
+                    let pill = Rect::from_center_size(center, vec2(122.0, 34.0) * (0.85 + 0.15 * h));
+                    ui.painter().rect_filled(pill, cr(17), alpha(accent(), 0.95 * h));
+                    ui.painter().text(pill.center(), Align2::CENTER_CENTER, "⬇  Get Album", bold(13.5), alpha(on_accent(), h));
+                }
+            }
+        }
+        let y0 = art.bottom() + 10.0;
+        text(ui, pos2(art.left(), y0), &r.title, font(13.5), DIM, art.width());
+        let sub = match r.year {
+            Some(y) => format!("{y} · {} songs", r.track_count),
+            None => format!("{} songs", r.track_count),
+        };
+        text(ui, pos2(art.left(), y0 + 19.0), &sub, font(12.5), FAINT, art.width());
+        let tip = match job {
+            Some(j) if j.failed => format!("Couldn't download: {}. Click to try again.", j.status),
+            _ => "Not in your library — click to find every song on YouTube and add the album".into(),
+        };
+        let resp = resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
+        if resp.clicked() && !busy {
+            self.acts.push(Action::DownloadCatalogAlbum(r.clone()));
+        }
     }
 
     fn album_tile(&mut self, ui: &mut Ui, ai: usize, art: Rect) {
@@ -2559,7 +2786,19 @@ impl<'a> V<'a> {
                 }
             });
         };
-        self.album_grid(ui, &name, &albums, Some(&header));
+        // Albums on Apple's catalogue that aren't in the library yet.
+        let missing: Vec<crate::ytdl::CatalogAlbumRef> = match self.discos.get(&name) {
+            None => {
+                self.acts.push(Action::FetchDiscography(name.clone()));
+                vec![]
+            }
+            Some(Disco::Ready(Some(list))) => {
+                let owned: std::collections::HashSet<String> = self.lib.albums.iter().map(|a| crate::ytdl::base_album(&a.title)).collect();
+                list.iter().filter(|r| !owned.contains(&crate::ytdl::base_album(&r.title))).cloned().collect()
+            }
+            _ => vec![],
+        };
+        self.album_grid(ui, &name, &albums, Some(&header), &missing);
         self.acts.extend(acts.into_inner());
     }
 
