@@ -74,6 +74,8 @@ enum Action {
     SetLevelVolume(bool),
     /// Look up an artist's full discography.
     FetchDiscography(String),
+    FetchLyrics(TrackId),
+    ToggleLyrics,
     /// Download a whole album from an artist's discography.
     DownloadCatalogAlbum(crate::ytdl::CatalogAlbumRef),
 }
@@ -116,6 +118,7 @@ struct UiState {
     show_folders: bool,
     show_link: bool,
     link_text: String,
+    show_lyrics: bool,
 }
 
 /// One "Add from Link" download, as shown in the window.
@@ -163,6 +166,8 @@ struct V<'a> {
     discos: &'a HashMap<String, Disco>,
     /// catalogue album id → download job
     album_jobs: &'a HashMap<u64, u64>,
+    /// None while still looking.
+    lyrics: &'a HashMap<TrackId, Option<crate::lyrics::Lyrics>>,
 }
 
 pub struct App {
@@ -221,6 +226,9 @@ pub struct App {
     album_jobs: HashMap<u64, u64>,
     /// Unfinished downloads by job id (persisted to downloads.json).
     pending: std::collections::BTreeMap<u64, Pending>,
+    lyrics: HashMap<TrackId, Option<crate::lyrics::Lyrics>>,
+    lyr_tx: std::sync::mpsc::Sender<(TrackId, crate::lyrics::Lyrics)>,
+    lyr_rx: Receiver<(TrackId, crate::lyrics::Lyrics)>,
 }
 
 impl App {
@@ -232,6 +240,7 @@ impl App {
         let (yt_tx, yt_rx) = channel();
         let (tl_tx, tl_rx) = channel();
         let (disco_tx, disco_rx) = channel();
+        let (lyr_tx, lyr_rx) = channel();
         // One worker measures loudness, a song at a time.
         let (loud_tx, loud_jobs) = channel::<(TrackId, PathBuf)>();
         let (loud_res_tx, loud_rx) = channel();
@@ -298,6 +307,9 @@ impl App {
             disco_rx,
             album_jobs: HashMap::new(),
             pending: Default::default(),
+            lyrics: HashMap::new(),
+            lyr_tx,
+            lyr_rx,
             xmb: cc.gl.as_ref().and_then(|gl| match crate::xmb::Xmb::new(gl) {
                 Ok(x) => Some(Arc::new(Mutex::new(x))),
                 Err(e) => {
@@ -334,6 +346,7 @@ impl App {
                 _ => View::RecentlyAdded,
             };
         }
+        app.st.show_lyrics = std::env::var("MH_LYRICS").is_ok();
         // Test screenshots: MH_LINK=demo opens Add from Link with sample rows.
         if std::env::var("MH_LINK").as_deref() == Ok("demo") {
             app.st.show_link = true;
@@ -355,7 +368,12 @@ impl App {
         }
         if std::env::var("MH_PLAY").is_ok() {
             let ids: Vec<_> = app.lib.data.tracks.iter().map(|t| t.id).collect();
-            app.player.play_list(&app.lib, ids, 0);
+            let q = std::env::var("MH_PLAY").unwrap_or_default().to_lowercase();
+            let start = app.lib.data.tracks.iter().position(|t| !q.is_empty() && t.title.to_lowercase().contains(&q)).unwrap_or(0);
+            app.player.play_list(&app.lib, ids, start);
+            if let Some(at) = std::env::var("MH_SEEK").ok().and_then(|v| v.parse::<f64>().ok()) {
+                app.player.seek(at);
+            }
             app.st.show_queue = std::env::var("MH_QUEUE").is_ok();
         }
         app.player.level_volume = app.lib.data.level_volume.unwrap_or(true);
@@ -597,6 +615,29 @@ impl App {
                     self.player.play_next(id);
                     self.player.next(&self.lib);
                 }
+                Action::ToggleLyrics => {
+                    self.st.show_lyrics = !self.st.show_lyrics;
+                    if self.st.show_lyrics && self.view != View::NowPlaying {
+                        self.go(ctx, View::NowPlaying);
+                    }
+                }
+                Action::FetchLyrics(id) => {
+                    if let (false, Some(t)) = (self.lyrics.contains_key(&id), self.lib.track(id)) {
+                        self.lyrics.insert(id, None);
+                        let q = crate::lyrics::Query {
+                            path: t.path.clone(),
+                            title: t.title.clone(),
+                            artist: t.artist.clone(),
+                            album: t.album.clone(),
+                            duration: t.duration_secs,
+                        };
+                        let (tx, wake) = (self.lyr_tx.clone(), ctx.clone());
+                        std::thread::spawn(move || {
+                            let _ = tx.send((id, crate::lyrics::find(&q)));
+                            wake.request_repaint();
+                        });
+                    }
+                }
                 Action::FetchDiscography(artist) => {
                     if !self.discos.contains_key(&artist) {
                         self.discos.insert(artist.clone(), Disco::Loading);
@@ -781,6 +822,9 @@ impl App {
         while let Ok((key, tl)) = self.tl_rx.try_recv() {
             self.tracklists.insert(key, Tracklist::Ready(tl));
         }
+        while let Ok((id, l)) = self.lyr_rx.try_recv() {
+            self.lyrics.insert(id, Some(l));
+        }
         while let Ok((artist, d)) = self.disco_rx.try_recv() {
             self.discos.insert(artist, Disco::Ready(d));
         }
@@ -905,6 +949,9 @@ impl App {
             if !typing && !cmd {
                 if i.key_pressed(Key::Space) {
                     acts.push(Action::Toggle);
+                }
+                if i.key_pressed(Key::L) {
+                    acts.push(Action::ToggleLyrics);
                 }
                 if i.key_pressed(Key::ArrowRight) {
                     acts.push(Action::Seek(self.player.position() + 10.0));
@@ -1146,6 +1193,7 @@ impl eframe::App for App {
             track_jobs: &self.track_jobs,
             discos: &self.discos,
             album_jobs: &self.album_jobs,
+            lyrics: &self.lyrics,
         };
         v.player_bar(ctx, self.track_at);
         v.sidebar(ctx, self.scan_progress, !self.history.is_empty());
@@ -2894,33 +2942,75 @@ impl<'a> V<'a> {
             return;
         };
         let album = self.lib.album_of(t.id).cloned();
+        let lyr_k = anim(ui, ui.id().with("lyr-k"), self.st.show_lyrics, 0.3);
 
-        let recs_h = if full.height() > 430.0 && !self.recs.is_empty() { (full.height() * 0.4).clamp(176.0, 242.0) } else { 0.0 };
+        let recs_h = if !self.st.show_lyrics && full.height() > 430.0 && !self.recs.is_empty() { (full.height() * 0.4).clamp(176.0, 242.0) } else { 0.0 };
         let top = Rect::from_min_max(full.min, pos2(full.right(), full.bottom() - recs_h));
         let inner = top.shrink2(vec2(56.0, 24.0));
+
+        if self.st.show_lyrics {
+            // Lyrics view: cover + controls in a column on the left, lyrics on the right.
+            let col_w = (inner.width() * 0.4).clamp(260.0, 420.0);
+            let lyr = Rect::from_min_max(pos2(inner.left() + col_w + 56.0, full.top() + 24.0), pos2(inner.right(), full.bottom() - 24.0));
+            // Soft scrim so lines stay readable on bright covers.
+            let scrim = Rect::from_min_max(pos2(lyr.left() - 40.0, full.top()), full.max);
+            let mut mesh = egui::Mesh::default();
+            let (c0, c1) = (Color32::from_black_alpha(0), Color32::from_black_alpha((95.0 * lyr_k) as u8));
+            mesh.colored_vertex(scrim.left_top(), c0);
+            mesh.colored_vertex(scrim.left_top() + vec2(120.0, 0.0), c1);
+            mesh.colored_vertex(scrim.left_bottom(), c0);
+            mesh.colored_vertex(scrim.left_bottom() + vec2(120.0, 0.0), c1);
+            mesh.colored_vertex(scrim.right_top(), c1);
+            mesh.colored_vertex(scrim.right_bottom(), c1);
+            for tri in [[0, 1, 2], [1, 2, 3], [1, 4, 3], [4, 3, 5]] {
+                mesh.add_triangle(tri[0], tri[1], tri[2]);
+            }
+            ui.painter().add(mesh);
+            let mut lui = ui.new_child(egui::UiBuilder::new().max_rect(lyr));
+            lui.multiply_opacity(lyr_k);
+            self.lyrics_panel(&mut lui, lyr, &t);
+
+            let art_size = (col_w * 0.82).min(inner.height() - 270.0).max(110.0);
+            let block_h = art_size + 270.0;
+            let y0 = inner.top() + ((inner.height() - block_h) / 2.0).max(0.0);
+            let art = Rect::from_min_size(pos2(inner.left() + (col_w - art_size) / 2.0, y0), vec2(art_size, art_size));
+            self.np_art(ui, album.as_ref(), art);
+            self.np_info(ui, &t, inner.left(), art.bottom() + 24.0, col_w);
+            return;
+        }
+
         let art_size = (inner.height() * 0.9).min(inner.width() * 0.3).clamp(140.0, 360.0);
         let gap = 52.0;
         let right_w = (inner.width() - art_size - gap).min(500.0);
         let total_w = art_size + gap + right_w;
         let x0 = inner.center().x - total_w / 2.0;
         let art = Rect::from_min_size(pos2(x0, inner.center().y - art_size / 2.0), vec2(art_size, art_size));
-        let art_s = art;
-        shadow(ui, art_s, 14, 50, 18, 0.6);
-        if let Some(a) = &album {
-            self.album_art_hd(ui, a, art_s, 14);
-            let r = ui.interact(art_s, ui.id().with("np-big-art"), Sense::click());
+        self.np_art(ui, album.as_ref(), art);
+        let y = (art.center().y - 112.0).max(top.top() + 12.0);
+        self.np_info(ui, &t, art.right() + gap, y, right_w);
+
+        if recs_h > 0.0 {
+            self.recommendations(ui, Rect::from_min_max(pos2(full.left(), full.bottom() - recs_h), full.max));
+        }
+    }
+
+    fn np_art(&mut self, ui: &mut Ui, album: Option<&Album>, art: Rect) {
+        shadow(ui, art, 14, 50, 18, 0.6);
+        if let Some(a) = album {
+            self.album_art_hd(ui, a, art, 14);
+            let r = ui.interact(art, ui.id().with("np-big-art"), Sense::click());
             if r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Go to Album").clicked() {
                 self.acts.push(Action::Go(View::Album(a.key.clone())));
             }
         }
+    }
 
-        // Info + controls, centred on the cover.
-        let tx = art.right() + gap;
-        let mut y = (art.center().y - 112.0).max(top.top() + 12.0);
+    /// Title, artist, progress, transport controls and "Next" line.
+    fn np_info(&mut self, ui: &mut Ui, t: &Track, tx: f32, mut y: f32, right_w: f32) {
         let galley = ui.painter().layout(t.title.clone(), bold(28.0), TEXT, right_w - 36.0);
         let gh = galley.size().y.min(70.0);
         ui.painter().galley(pos2(tx, y), galley, TEXT);
-        self.heart(ui, &t, pos2(tx + right_w - 12.0, y + 16.0), 20.0);
+        self.heart(ui, t, pos2(tx + right_w - 12.0, y + 16.0), 20.0);
         y += gh + 4.0;
         let ar = text(ui, pos2(tx, y), &t.artist, font(18.0), Color32::from_white_alpha(235), right_w);
         if ui.interact(ar, ui.id().with("np-artist"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -2931,7 +3021,7 @@ impl<'a> V<'a> {
         text(ui, pos2(tx, y), &sub, font(13.5), Color32::from_white_alpha(170), right_w);
         y += 40.0;
         let mut pui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(tx, y), vec2(right_w, 24.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        self.progress_row(&mut pui, Some(&t), right_w, 12.0);
+        self.progress_row(&mut pui, Some(t), right_w, 12.0);
         y += 36.0;
         let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(tx, y), vec2(right_w, 64.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
         cui.spacing_mut().item_spacing.x = 18.0;
@@ -2954,15 +3044,98 @@ impl<'a> V<'a> {
             self.acts.push(Action::ToggleLoop);
         }
         y += 76.0;
+        // Lyrics toggle, right-aligned under the controls.
+        let lr = Rect::from_min_size(pos2(tx + right_w - 64.0, y - 4.0), vec2(64.0, 24.0));
+        let lresp = ui.interact(lr, ui.id().with("np-lyrics"), Sense::click());
+        let lh = anim(ui, lresp.id, lresp.hovered(), 0.15);
+        let on = self.st.show_lyrics;
+        if on || lh > 0.0 {
+            ui.painter().rect_filled(lr, cr(12), if on { alpha(accent(), 0.9) } else { Color32::from_white_alpha((28.0 * lh) as u8) });
+        }
+        let lc = if on { on_accent() } else { lerp(DIM, TEXT, lh) };
+        ui.painter().text(lr.center(), Align2::CENTER_CENTER, "Lyrics", bold(12.0), lc);
+        if lresp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Show lyrics (L)").clicked() {
+            self.acts.push(Action::ToggleLyrics);
+        }
         if let Some(next) = self.player.up_next().first().and_then(|id| self.lib.track(*id)).cloned() {
-            let r = text(ui, pos2(tx, y), &format!("Next: {} — {}", next.title, next.artist), font(12.5), DIM, right_w);
+            let r = text(ui, pos2(tx, y), &format!("Next: {} — {}", next.title, next.artist), font(12.5), DIM, right_w - 76.0);
             if ui.interact(r, ui.id().with("np-next"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.acts.push(Action::JumpUpNext(0));
             }
         }
+    }
 
-        if recs_h > 0.0 {
-            self.recommendations(ui, Rect::from_min_max(pos2(full.left(), full.bottom() - recs_h), full.max));
+    /// Lyrics beside the cover: synced lines scroll along with the song and
+    /// the current one lights up; click a line to jump there.
+    fn lyrics_panel(&mut self, ui: &mut Ui, r: Rect, t: &Track) {
+        use crate::lyrics::Lyrics;
+        let note = |ui: &Ui, s: &str| {
+            ui.painter().text(pos2(r.left(), r.center().y), Align2::LEFT_CENTER, s, bold(20.0), Color32::from_white_alpha(120));
+        };
+        let lines = match self.lyrics.get(&t.id) {
+            None => {
+                self.acts.push(Action::FetchLyrics(t.id));
+                return note(ui, "Looking for lyrics…");
+            }
+            Some(None) => return note(ui, "Looking for lyrics…"),
+            Some(Some(Lyrics::None)) => return note(ui, "No lyrics found for this song"),
+            Some(Some(Lyrics::Instrumental)) => return note(ui, "♪  Instrumental"),
+            Some(Some(Lyrics::Plain(text))) => {
+                let text = text.clone();
+                let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(r));
+                egui::ScrollArea::vertical().id_salt(("plain-lyrics", t.id)).auto_shrink(false).show(&mut cui, |ui| {
+                    ui.add_space(r.height() * 0.2);
+                    ui.label(egui::RichText::new(text).font(bold(20.0)).color(Color32::from_white_alpha(200)).line_height(Some(32.0)));
+                    ui.add_space(r.height() * 0.4);
+                });
+                return;
+            }
+            Some(Some(Lyrics::Synced(lines))) => lines.clone(),
+        };
+        let pos = self.player.position();
+        // Lines light up a touch early so they arrive with the singer.
+        let cur = lines.partition_point(|(at, _)| *at <= pos + 0.25).checked_sub(1);
+        let painter = ui.painter_at(r);
+        let gap = 20.0;
+        let galleys: Vec<_> = lines
+            .iter()
+            .map(|(_, s)| {
+                let s = if s.trim().is_empty() { "♪".to_string() } else { s.clone() };
+                painter.layout(s, bold(24.0), TEXT, r.width() - 12.0)
+            })
+            .collect();
+        let mut ys = Vec::with_capacity(galleys.len());
+        let mut y = 0.0;
+        for g in &galleys {
+            ys.push(y);
+            y += g.size().y + gap;
+        }
+        let focus = match cur {
+            Some(i) => ys[i] + galleys[i].size().y / 2.0,
+            None => 0.0,
+        };
+        let target = focus - r.height() * 0.38;
+        let off = ui.ctx().animate_value_with_time(ui.id().with(("lyr-off", t.id)), target, 0.5);
+        if (off - target).abs() > 0.5 {
+            ui.ctx().request_repaint();
+        }
+        for (i, g) in galleys.into_iter().enumerate() {
+            let top = r.top() + ys[i] - off;
+            let h = g.size().y;
+            if top + h < r.top() || top > r.bottom() {
+                continue;
+            }
+            let rect = Rect::from_min_size(pos2(r.left(), top), vec2(r.width(), h));
+            let resp = ui.interact(rect.expand2(vec2(0.0, gap / 2.0)), ui.id().with(("lyr", t.id, i)), Sense::click());
+            let hov = anim(ui, resp.id, resp.hovered(), 0.12);
+            let lit = anim(ui, resp.id.with("lit"), cur == Some(i), 0.3);
+            // Fade lines out toward the panel's top and bottom edges.
+            let edge = ((top - r.top()) / 70.0).min((r.bottom() - top - h) / 70.0).clamp(0.0, 1.0);
+            let a = (0.32 + 0.68 * lit).max(0.32 + 0.3 * hov) * (0.15 + 0.85 * edge);
+            painter.galley_with_override_text_color(rect.min, g, Color32::from_white_alpha((255.0 * a) as u8));
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.acts.push(Action::Seek(lines[i].0));
+            }
         }
     }
 

@@ -9,6 +9,7 @@ mod opus;
 mod kit;
 mod library;
 mod loudness;
+mod lyrics;
 mod media;
 mod player;
 mod recommend;
