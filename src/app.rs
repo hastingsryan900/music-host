@@ -71,6 +71,7 @@ enum Action {
     /// Stop one download (Some(job)) or all of them (None).
     StopDownload(Option<u64>),
     ClearFinishedDownloads,
+    SetLevelVolume(bool),
 }
 
 /// Full tracklist lookup state for an album.
@@ -183,6 +184,10 @@ pub struct App {
     track_jobs: HashMap<(String, String), u64>,
     tl_tx: std::sync::mpsc::Sender<(String, Option<crate::ytdl::CatalogAlbum>)>,
     tl_rx: Receiver<(String, Option<crate::ytdl::CatalogAlbum>)>,
+    /// Background loudness analysis (volume levelling).
+    loud_tx: std::sync::mpsc::Sender<(TrackId, PathBuf)>,
+    loud_rx: Receiver<(TrackId, Option<(f32, f32)>)>,
+    loud_pending: std::collections::HashSet<TrackId>,
 }
 
 impl App {
@@ -193,6 +198,22 @@ impl App {
         let d = DEFAULT_ACCENT;
         let (yt_tx, yt_rx) = channel();
         let (tl_tx, tl_rx) = channel();
+        // One worker measures loudness, a song at a time.
+        let (loud_tx, loud_jobs) = channel::<(TrackId, PathBuf)>();
+        let (loud_res_tx, loud_rx) = channel();
+        let wake = cc.egui_ctx.clone();
+        std::thread::Builder::new()
+            .name("loudness".into())
+            .spawn(move || {
+                for (id, path) in loud_jobs {
+                    let r = crate::loudness::analyze(&path);
+                    if loud_res_tx.send((id, r)).is_err() {
+                        return;
+                    }
+                    wake.request_repaint();
+                }
+            })
+            .ok();
         let mut app = App {
             art: ArtCache::new(&cc.egui_ctx),
             media: if std::env::var("MH_SCREENSHOT").is_ok() || std::env::var("MH_FPS").is_ok() { None } else { Media::new() },
@@ -235,6 +256,9 @@ impl App {
             track_jobs: HashMap::new(),
             tl_tx,
             tl_rx,
+            loud_tx,
+            loud_rx,
+            loud_pending: Default::default(),
             xmb: cc.gl.as_ref().and_then(|gl| match crate::xmb::Xmb::new(gl) {
                 Ok(x) => Some(Arc::new(Mutex::new(x))),
                 Err(e) => {
@@ -282,6 +306,8 @@ impl App {
             app.player.play_list(&app.lib, ids, 0);
             app.st.show_queue = std::env::var("MH_QUEUE").is_ok();
         }
+        app.player.level_volume = app.lib.data.level_volume.unwrap_or(true);
+        app.queue_loudness();
         let folders = app.lib.data.folders.clone();
         if !folders.is_empty() {
             app.start_scan(&cc.egui_ctx, folders);
@@ -320,10 +346,35 @@ impl App {
             }
             self.scan_rx = None;
             self.scan_progress = None;
+            self.queue_loudness();
             if !self.pending_scan.is_empty() {
                 let next = std::mem::take(&mut self.pending_scan);
                 self.start_scan(ctx, next);
             }
+        }
+    }
+
+    /// Queue every song without a loudness measurement for analysis.
+    fn queue_loudness(&mut self) {
+        for t in &self.lib.data.tracks {
+            if t.loudness.is_none() && self.loud_pending.insert(t.id) {
+                let _ = self.loud_tx.send((t.id, t.path.clone()));
+            }
+        }
+    }
+
+    fn pump_loudness(&mut self) {
+        let mut refresh = false;
+        let soon: Vec<TrackId> = self.player.current().into_iter().chain(self.player.up_next().into_iter().take(1)).collect();
+        while let Ok((id, r)) = self.loud_rx.try_recv() {
+            if let (Some((lufs, peak)), Some(t)) = (r, self.lib.track_mut(id)) {
+                t.loudness = Some(lufs);
+                t.peak = Some(peak);
+                refresh |= soon.contains(&id);
+            }
+        }
+        if refresh {
+            self.player.refresh_gain(&self.lib);
         }
     }
 
@@ -484,6 +535,12 @@ impl App {
                     }
                 }
                 Action::ClearFinishedDownloads => self.jobs.retain(|j| !j.done),
+                Action::SetLevelVolume(on) => {
+                    self.player.level_volume = on;
+                    self.lib.data.level_volume = Some(on);
+                    self.lib.mark_dirty();
+                    self.player.refresh_gain(&self.lib);
+                }
                 Action::PlayNow(id) => {
                     self.player.play_next(id);
                     self.player.next(&self.lib);
@@ -889,6 +946,20 @@ impl eframe::App for App {
         self.art.pump(ctx);
         self.pump_scan(ctx);
         self.pump_links(ctx);
+        self.pump_loudness();
+        if let Some(name) = self.player.device_changed.take() {
+            if std::env::var("MH_DEVTEST").is_ok() {
+                eprintln!("device switch → {name}: resumed {:?} at {:.2}s, playing={}", self.player.current(), self.player.position(), self.player.is_playing());
+            }
+            self.toast(ctx, format!("Now playing on {name}"));
+        }
+        // Testing aid: MH_DEVTEST=1 simulates an output switch 3 s in.
+        if std::env::var("MH_DEVTEST").is_ok() && self.frame % 60 == 0 {
+            eprintln!("t={now:.1}s pos {:.2}s current {:?}", self.player.position(), self.player.current());
+            if (now - 3.0).abs() < 0.6 {
+                self.player.debug_force_device_change();
+            }
+        }
         self.player.tick(&self.lib);
         if let Some(id) = self.player.just_started.take() {
             if let Some(t) = self.lib.track_mut(id) {
@@ -1673,6 +1744,31 @@ impl<'a> V<'a> {
                 });
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Tip: drag folders or files onto the window to add them.").size(11.0).color(FAINT));
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(6.0);
+                // Volume levelling switch.
+                ui.horizontal(|ui| {
+                    let on = self.player.level_volume;
+                    let (r, resp) = ui.allocate_exact_size(vec2(38.0, 22.0), Sense::click());
+                    let k = anim(ui, resp.id, on, 0.15);
+                    ui.painter().rect_filled(r, cr(11), lerp(Color32::from_rgb(70, 70, 78), accent(), k));
+                    ui.painter().circle_filled(pos2(r.left() + 11.0 + 16.0 * k, r.center().y), 8.5, Color32::WHITE);
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.acts.push(Action::SetLevelVolume(!on));
+                    }
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Even out volume").font(bold(13.0)));
+                        let total = self.lib.data.tracks.len();
+                        let done = self.lib.data.tracks.iter().filter(|t| t.loudness.is_some()).count();
+                        let note = if done < total {
+                            format!("Keeps songs at a similar loudness · measuring {done} of {total}")
+                        } else {
+                            "Keeps songs at a similar loudness (albums keep their own balance)".to_string()
+                        };
+                        ui.label(egui::RichText::new(note).size(11.0).color(FAINT));
+                    });
+                });
             });
         if !open {
             self.st.show_folders = false;

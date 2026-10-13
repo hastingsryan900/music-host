@@ -47,6 +47,11 @@ pub struct Track {
     /// Times this was abandoned early (under 30s and under half its length).
     #[serde(default)]
     pub skips: u32,
+    /// Integrated loudness (LUFS) and sample peak, for volume levelling.
+    #[serde(default)]
+    pub loudness: Option<f32>,
+    #[serde(default)]
+    pub peak: Option<f32>,
     /// Whether album_artist came from a tag (vs. derived from the artist).
     #[serde(default)]
     pub album_artist_tagged: bool,
@@ -91,6 +96,9 @@ pub struct LibraryData {
     /// Bumped when tag parsing changes, forcing a re-read of every file.
     #[serde(default)]
     pub scan_version: u32,
+    /// Even out loudness between songs (default on).
+    #[serde(default)]
+    pub level_volume: Option<bool>,
 }
 
 pub struct Library {
@@ -215,6 +223,10 @@ impl Library {
                 t.loved = prev.loved;
                 t.listened_secs = prev.listened_secs;
                 t.skips = prev.skips;
+                if prev.mtime == t.mtime {
+                    t.loudness = prev.loudness;
+                    t.peak = prev.peak;
+                }
             }
             tracks.push(t);
         }
@@ -474,6 +486,8 @@ fn read_track(path: &Path, mtime: u64, now: u64) -> Track {
         album_artist_tagged: false,
         listened_secs: 0.0,
         skips: 0,
+        loudness: None,
+        peak: None,
     };
 
     if let Ok(tf) = read_tags(path) {

@@ -46,17 +46,17 @@ impl Dec {
 }
 
 /// Packet-level decoder at the file's native rate (runs on its own thread).
-struct Decoding {
+pub(crate) struct Decoding {
     format: Box<dyn FormatReader>,
     decoder: Dec,
     track_id: u32,
-    spec: SignalSpec,
+    pub(crate) spec: SignalSpec,
     /// Frames to drop after an accurate seek lands slightly early.
     skip_frames: u64,
 }
 
 impl Decoding {
-    fn open(path: &Path) -> Result<(Self, Option<Duration>), String> {
+    pub(crate) fn open(path: &Path) -> Result<(Self, Option<Duration>), String> {
         let file = File::open(path).map_err(|e| e.to_string())?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
@@ -100,7 +100,7 @@ impl Decoding {
     }
 
     /// Decode the next packet as interleaved samples. `None` at end of stream.
-    fn next_packet(&mut self) -> Option<Vec<f32>> {
+    pub(crate) fn next_packet(&mut self) -> Option<Vec<f32>> {
         let mut errors = 0;
         loop {
             let packet = match self.format.next_packet() {
@@ -176,6 +176,15 @@ impl Decoding {
             }
             Err(_) => false,
         }
+    }
+}
+
+/// Interleaved `ch`-channel samples → interleaved stereo.
+fn to_stereo(samples: Vec<f32>, ch: usize) -> Vec<f32> {
+    match ch {
+        2 => samples,
+        1 => samples.iter().flat_map(|&s| [s, s]).collect(),
+        _ => samples.chunks_exact(ch).flat_map(|f| [f[0], f[1]]).collect(),
     }
 }
 
@@ -311,7 +320,10 @@ impl AudioSource {
         let (mut dec, duration) = Decoding::open(path)?;
         // Decode the first packet now so broken files fail here, not later.
         let first = dec.next_packet().ok_or("file contains no playable audio")?;
-        let channels = dec.spec.channels.count().max(1);
+        // Everything leaves here as stereo, so songs can follow one another
+        // in a single gapless stream.
+        let channels = 2usize;
+        let first = to_stereo(first, dec.spec.channels.count().max(1));
         let in_rate = dec.spec.rate;
         let mut resample = match out_rate {
             Some(r) if r != in_rate => Resample::new(in_rate, r, channels),
@@ -403,10 +415,13 @@ fn decoder_thread(mut dec: Decoding, mut resample: Option<Resample>, link: Link,
         let mut out = Vec::with_capacity(8192);
         while out.len() < 8192 {
             match dec.next_packet() {
-                Some(samples) => match &mut resample {
-                    Some(r) => r.push(&samples, &mut out),
-                    None => out.extend_from_slice(&samples),
-                },
+                Some(samples) => {
+                    let samples = to_stereo(samples, dec.spec.channels.count().max(1));
+                    match &mut resample {
+                        Some(r) => r.push(&samples, &mut out),
+                        None => out.extend_from_slice(&samples),
+                    }
+                }
                 None => {
                     if let Some(r) = &mut resample {
                         r.flush(&mut out);

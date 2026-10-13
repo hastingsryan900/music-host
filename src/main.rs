@@ -8,6 +8,7 @@ mod decode;
 mod opus;
 mod kit;
 mod library;
+mod loudness;
 mod media;
 mod player;
 mod recommend;
