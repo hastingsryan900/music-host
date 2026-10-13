@@ -102,6 +102,9 @@ pub struct LibraryData {
     /// Seconds listened per local day (days since 1970-01-01).
     #[serde(default)]
     pub daily: BTreeMap<i64, f64>,
+    /// "Listen on your iPhone" (off unless turned on).
+    #[serde(default)]
+    pub stream: Option<bool>,
 }
 
 /// Today's local date as days since 1970-01-01.

@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Music Host">
+<meta name="theme-color" content="#121214">
+<title>Music Host</title>
+<style>
+  :root { --bg:#121214; --card:#1c1c20; --text:#f2f2f5; --dim:#9696a0; --faint:#5a5a62; --accent:#a58bff; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; background:var(--bg); color:var(--text);
+    font:16px/1.35 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+  header { position:sticky; top:0; z-index:5; padding:calc(env(safe-area-inset-top) + 10px) 16px 10px;
+    background:rgba(18,18,20,.82); backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px); }
+  h1 { margin:4px 0 10px; font-size:30px; font-weight:800; letter-spacing:-.02em; }
+  #back { display:none; color:var(--accent); font-size:17px; background:none; border:0; padding:0; margin-bottom:2px; }
+  input { width:100%; padding:9px 12px; border-radius:10px; border:0; background:#26262b; color:var(--text); font-size:16px; outline:none; }
+  main { padding:8px 16px calc(110px + env(safe-area-inset-bottom)); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:18px 14px; }
+  .tile img, .ph { width:100%; aspect-ratio:1; border-radius:8px; object-fit:cover; display:block; background:var(--card); box-shadow:0 6px 18px rgba(0,0,0,.35); }
+  .tile .t { margin-top:7px; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tile .a { font-size:13px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .album-head { display:flex; flex-direction:column; align-items:center; text-align:center; gap:6px; margin:6px 0 18px; }
+  .album-head img { width:64%; max-width:280px; aspect-ratio:1; border-radius:10px; box-shadow:0 14px 36px rgba(0,0,0,.5); }
+  .album-head .t { font-size:20px; font-weight:700; margin-top:8px; }
+  .album-head .a { color:var(--accent); font-size:17px; }
+  .album-head .y { color:var(--dim); font-size:13px; }
+  .btns { display:flex; gap:12px; justify-content:center; margin:10px 0 4px; }
+  .btn { flex:1; max-width:160px; padding:11px; border-radius:10px; border:0; background:#26262b; color:var(--accent); font-weight:600; font-size:16px; }
+  .row { display:flex; align-items:center; gap:12px; padding:11px 2px; border-bottom:1px solid #222227; }
+  .row .n { width:22px; text-align:right; color:var(--faint); font-size:14px; }
+  .row .t { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .row .d { color:var(--faint); font-size:14px; }
+  .row.on .t, .row.on .n { color:var(--accent); font-weight:600; }
+  #bar { position:fixed; left:8px; right:8px; bottom:calc(8px + env(safe-area-inset-bottom)); z-index:10;
+    display:none; align-items:center; gap:12px; padding:8px 12px 8px 8px; border-radius:14px;
+    background:rgba(38,38,44,.86); backdrop-filter:blur(24px); -webkit-backdrop-filter:blur(24px); box-shadow:0 8px 28px rgba(0,0,0,.5); }
+  #bar img { width:46px; height:46px; border-radius:7px; object-fit:cover; background:var(--card); }
+  #bar .info { flex:1; min-width:0; }
+  #bar .t { font-size:15px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #bar .a { font-size:13px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #bar button { background:none; border:0; color:var(--text); width:38px; height:38px; padding:0; }
+  #prog { position:absolute; left:14px; right:14px; bottom:3px; height:2px; border-radius:2px; background:rgba(255,255,255,.12); overflow:hidden; }
+  #prog div { height:100%; width:0; background:var(--accent); }
+  svg { width:26px; height:26px; fill:currentColor; }
+  .empty { color:var(--dim); text-align:center; margin-top:60px; }
+</style>
+</head>
+<body>
+<header>
+  <button id="back" onclick="home()">‹ Library</button>
+  <h1 id="title">Library</h1>
+  <input id="q" type="search" placeholder="Search albums, artists, songs" oninput="render()">
+</header>
+<main id="main"></main>
+<div id="bar">
+  <img id="bart" alt="">
+  <div class="info"><div class="t" id="bt"></div><div class="a" id="ba"></div></div>
+  <button onclick="toggle()" aria-label="Play/Pause"><svg id="pp" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></button>
+  <button onclick="next()" aria-label="Next"><svg viewBox="0 0 24 24"><path d="M5 6l8.5 6L5 18zm9 0l8.5 6-8.5 6z" transform="scale(.92) translate(1,1)"/></svg></button>
+  <div id="prog"><div id="pf"></div></div>
+</div>
+<audio id="au" preload="auto"></audio>
+<script>
+const T = new URLSearchParams(location.search).get('t');
+const q = p => p + (p.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(T);
+const $ = id => document.getElementById(id);
+const au = $('au');
+let albums = [], view = null, queue = [], pos = -1;
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt = s => { s = Math.max(0, Math.round(s)); return Math.floor(s/60) + ':' + String(s%60).padStart(2,'0'); };
+const PLAY = '<path d="M8 5v14l11-7z"/>', PAUSE = '<path d="M7 5h3.5v14H7zm6.5 0H17v14h-3.5z"/>';
+
+fetch(q('/api/library')).then(r => r.json()).then(d => { albums = d.albums; render(); });
+
+function home() { view = null; $('q').value = ''; render(); scrollTo(0, 0); }
+function openAlbum(i) { view = i; render(); scrollTo(0, 0); }
+
+function render() {
+  const m = $('main');
+  $('back').style.display = view === null ? 'none' : 'block';
+  $('q').style.display = view === null ? 'block' : 'none';
+  if (view !== null) {
+    const a = albums[view];
+    $('title').textContent = '';
+    const cur = queue[pos];
+    m.innerHTML = `<div class="album-head"><img src="${q('/art/' + a.id)}" alt="">
+      <div class="t">${esc(a.title)}</div><div class="a">${esc(a.artist)}</div>
+      <div class="y">${[a.genre, a.year].filter(Boolean).map(esc).join(' · ')}</div></div>
+      <div class="btns"><button class="btn" onclick="playAlbum(${view},0)">▶ Play</button><button class="btn" onclick="shuffleAlbum(${view})">⤨ Shuffle</button></div>
+      ${a.tracks.map((t, i) => `<div class="row ${cur && cur.id === t.id ? 'on' : ''}" onclick="playAlbum(${view},${i})">
+        <span class="n">${i + 1}</span><span class="t">${esc(t.title)}${t.artist !== a.artist ? `<br><small style="color:var(--dim)">${esc(t.artist)}</small>` : ''}</span>
+        <span class="d">${fmt(t.duration)}</span></div>`).join('')}`;
+    return;
+  }
+  $('title').textContent = 'Library';
+  const s = $('q').value.trim().toLowerCase();
+  const list = albums.map((a, i) => [a, i]).filter(([a]) => !s || (a.title + ' ' + a.artist + ' ' + a.tracks.map(t => t.title).join(' ')).toLowerCase().includes(s));
+  m.innerHTML = list.length ? `<div class="grid">${list.map(([a, i]) => `<div class="tile" onclick="openAlbum(${i})">
+      <img loading="lazy" src="${q('/art/' + a.id + '?s=1')}" alt="" onerror="this.outerHTML='<div class=ph></div>'">
+      <div class="t">${esc(a.title)}</div><div class="a">${esc(a.artist)}</div></div>`).join('')}</div>`
+    : `<p class="empty">Nothing matches “${esc(s)}”</p>`;
+}
+
+function playAlbum(ai, i) {
+  queue = albums[ai].tracks.map(t => ({...t, album: albums[ai]}));
+  start(i);
+}
+function shuffleAlbum(ai) {
+  queue = albums[ai].tracks.map(t => ({...t, album: albums[ai]})).sort(() => Math.random() - .5);
+  start(0);
+}
+function start(i) {
+  pos = i;
+  const t = queue[pos];
+  if (!t) return;
+  au.src = q('/audio/' + t.id);
+  au.play();
+  $('bar').style.display = 'flex';
+  $('bart').src = q('/art/' + t.album.id + '?s=1');
+  $('bt').textContent = t.title;
+  $('ba').textContent = t.artist;
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({ title: t.title, artist: t.artist, album: t.album.title,
+      artwork: [{ src: new URL(q('/art/' + t.album.id), location.href).href, sizes: '1500x1500', type: 'image/jpeg' }] });
+  }
+  if (view !== null) render();
+}
+function toggle() { au.paused ? au.play() : au.pause(); }
+function next() { if (pos + 1 < queue.length) start(pos + 1); }
+function prev() { if (au.currentTime > 3) au.currentTime = 0; else if (pos > 0) start(pos - 1); }
+au.onended = next;
+au.onplay = au.onpause = () => { $('pp').innerHTML = au.paused ? PLAY : PAUSE; };
+au.ontimeupdate = () => { $('pf').style.width = (au.duration ? au.currentTime / au.duration * 100 : 0) + '%'; };
+if ('mediaSession' in navigator) {
+  navigator.mediaSession.setActionHandler('play', () => au.play());
+  navigator.mediaSession.setActionHandler('pause', () => au.pause());
+  navigator.mediaSession.setActionHandler('nexttrack', next);
+  navigator.mediaSession.setActionHandler('previoustrack', prev);
+  navigator.mediaSession.setActionHandler('seekto', e => { au.currentTime = e.seekTime; });
+}
+</script>
+</body>
+</html>

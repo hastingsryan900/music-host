@@ -14,6 +14,7 @@ mod media;
 mod menubar;
 mod player;
 mod recommend;
+mod stream;
 
 fn main() -> eframe::Result<()> {
     let icon = image::load_from_memory(include_bytes!("../assets/icon.png"))

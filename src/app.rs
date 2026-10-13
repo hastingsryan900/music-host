@@ -78,6 +78,8 @@ enum Action {
     FetchLyrics(TrackId),
     ToggleMini,
     ShowMain,
+    /// Turn "Listen on your iPhone" on or off.
+    SetStream(bool),
     ToggleLyrics,
     /// Download a whole album from an artist's discography.
     DownloadCatalogAlbum(crate::ytdl::CatalogAlbumRef),
@@ -172,6 +174,8 @@ struct V<'a> {
     album_jobs: &'a HashMap<u64, u64>,
     /// None while still looking.
     lyrics: &'a HashMap<TrackId, Option<crate::lyrics::Lyrics>>,
+    /// Phone streaming: Ok(url) while on, Err(reason) if it couldn't start.
+    stream: Option<Result<&'a str, &'a str>>,
 }
 
 pub struct App {
@@ -234,6 +238,7 @@ pub struct App {
     lyr_tx: std::sync::mpsc::Sender<(TrackId, crate::lyrics::Lyrics)>,
     lyr_rx: Receiver<(TrackId, crate::lyrics::Lyrics)>,
     menubar: Option<crate::menubar::MenuBar>,
+    stream: Option<Result<crate::stream::Server, String>>,
 }
 
 impl App {
@@ -315,6 +320,7 @@ impl App {
             lyrics: HashMap::new(),
             lyr_tx,
             lyr_rx,
+            stream: None,
             menubar: if std::env::var("MH_SCREENSHOT").is_ok() || std::env::var("MH_FPS").is_ok() { None } else { crate::menubar::MenuBar::new(&cc.egui_ctx) },
             xmb: cc.gl.as_ref().and_then(|gl| match crate::xmb::Xmb::new(gl) {
                 Ok(x) => Some(Arc::new(Mutex::new(x))),
@@ -340,6 +346,13 @@ impl App {
                 "songs" => View::Songs,
                 "now" => View::NowPlaying,
                 "stats" => View::Stats,
+                "settings" => {
+                    app.st.show_folders = true;
+                    if std::env::var("MH_STREAM").is_ok() {
+                        app.stream = Some(crate::stream::Server::start(app.stream_catalog()));
+                    }
+                    View::RecentlyAdded
+                }
                 "artists" => View::Artists(app.lib.artists.keys().next().cloned()),
                 "album" => app.lib.albums.first().map(|a| View::Album(a.key.clone())).unwrap_or(View::Albums),
                 v if v.starts_with("artist:") => {
@@ -385,6 +398,9 @@ impl App {
             app.st.show_queue = std::env::var("MH_QUEUE").is_ok();
         }
         app.player.level_volume = app.lib.data.level_volume.unwrap_or(true);
+        if app.lib.data.stream == Some(true) && std::env::var("MH_SCREENSHOT").is_err() {
+            app.stream = Some(crate::stream::Server::start(app.stream_catalog()));
+        }
         app.queue_loudness();
         let folders = app.lib.data.folders.clone();
         if !folders.is_empty() {
@@ -425,6 +441,9 @@ impl App {
             self.scan_rx = None;
             self.scan_progress = None;
             self.queue_loudness();
+            if let Some(Ok(s)) = &self.stream {
+                s.set_catalog(self.stream_catalog());
+            }
             if !self.pending_scan.is_empty() {
                 let next = std::mem::take(&mut self.pending_scan);
                 self.start_scan(ctx, next);
@@ -624,6 +643,11 @@ impl App {
                     self.player.next(&self.lib);
                 }
                 Action::ToggleMini => self.st.show_mini = !self.st.show_mini,
+                Action::SetStream(on) => {
+                    self.lib.data.stream = Some(on);
+                    self.lib.mark_dirty();
+                    self.stream = on.then(|| crate::stream::Server::start(self.stream_catalog()));
+                }
                 Action::ShowMain => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -688,6 +712,27 @@ impl App {
         }
         self.dispatch(ctx, urls.into_iter().map(Pending::Link).collect());
         self.st.link_text.clear();
+    }
+
+    /// The library as the phone player sees it.
+    fn stream_catalog(&self) -> crate::stream::Catalog {
+        let mut c = crate::stream::Catalog::default();
+        let mut albums = vec![];
+        for a in &self.lib.albums {
+            let id = crate::art::cache_path(&a.key).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let mut tracks = vec![];
+            for tid in &a.tracks {
+                let Some(t) = self.lib.track(*tid) else { continue };
+                c.tracks.insert(t.id, t.path.clone());
+                tracks.push(serde_json::json!({ "id": t.id.to_string(), "title": t.title, "artist": t.artist, "duration": t.duration_secs }));
+            }
+            let Some(first) = a.tracks.first().and_then(|id| self.lib.track(*id)) else { continue };
+            c.covers.insert(id.clone(), (crate::art::cache_path(&a.key), first.path.clone()));
+            albums.push(serde_json::json!({ "id": id, "title": a.title, "artist": a.artist, "year": a.year, "genre": a.genre, "added": a.added_at, "tracks": tracks }));
+        }
+        albums.sort_by_key(|a| std::cmp::Reverse(a["added"].as_u64().unwrap_or(0)));
+        c.json = serde_json::json!({ "albums": albums }).to_string();
+        c
     }
 
     /// Where new downloads go: the main library folder (under "YouTube/").
@@ -1230,6 +1275,7 @@ impl eframe::App for App {
             discos: &self.discos,
             album_jobs: &self.album_jobs,
             lyrics: &self.lyrics,
+            stream: self.stream.as_ref().map(|s| s.as_ref().map(|s| s.url.as_str()).map_err(|e| e.as_str())),
         };
         v.player_bar(ctx, self.track_at);
         v.sidebar(ctx, self.scan_progress, !self.history.is_empty());
@@ -1937,7 +1983,7 @@ impl<'a> V<'a> {
 
     fn folders_window(&mut self, ctx: &Context) {
         let mut open = true;
-        egui::Window::new("Music Folders")
+        egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -1997,6 +2043,42 @@ impl<'a> V<'a> {
                         ui.label(egui::RichText::new(note).size(11.0).color(FAINT));
                     });
                 });
+                ui.add_space(10.0);
+                // Phone streaming switch.
+                ui.horizontal(|ui| {
+                    let on = matches!(self.stream, Some(Ok(_)));
+                    let (r, resp) = ui.allocate_exact_size(vec2(38.0, 22.0), Sense::click());
+                    let k = anim(ui, resp.id, on, 0.15);
+                    ui.painter().rect_filled(r, cr(11), lerp(Color32::from_rgb(70, 70, 78), accent(), k));
+                    ui.painter().circle_filled(pos2(r.left() + 11.0 + 16.0 * k, r.center().y), 8.5, Color32::WHITE);
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.acts.push(Action::SetStream(!on));
+                    }
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Listen on your iPhone").font(bold(13.0)));
+                        let note = match self.stream {
+                            Some(Err(e)) => format!("Couldn't start: {e}"),
+                            Some(Ok(_)) => "Scan with your iPhone camera (same Wi-Fi). Add it to your Home Screen for an app icon.".into(),
+                            None => "Play your library on your phone over Wi-Fi".into(),
+                        };
+                        ui.label(egui::RichText::new(note).size(11.0).color(FAINT));
+                    });
+                });
+                if let Some(Ok(url)) = self.stream {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        qr_code(ui, url, 132.0);
+                        ui.vertical(|ui| {
+                            ui.add_space(6.0);
+                            ui.add(egui::Label::new(egui::RichText::new(url.split("?t=").next().unwrap_or(url)).font(bold(13.0)).color(TEXT)));
+                            ui.label(egui::RichText::new("Only devices with this code can connect.").size(11.0).color(FAINT));
+                            ui.add_space(6.0);
+                            if pill(ui, None, "Copy Link", false).clicked() {
+                                ui.ctx().copy_text(url.to_string());
+                            }
+                        });
+                    });
+                }
             });
         if !open {
             self.st.show_folders = false;
@@ -3610,6 +3692,25 @@ fn section(ui: &mut Ui, s: &str) {
 }
 
 /// A small painted ✕ (the glyph isn't in the UI font).
+/// A scannable QR code (dark modules on a white card).
+fn qr_code(ui: &mut Ui, data: &str, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    ui.painter().rect_filled(rect, cr(8), Color32::WHITE);
+    let Ok(code) = qrcode::QrCode::new(data.as_bytes()) else { return };
+    let n = code.width();
+    let colors = code.to_colors();
+    let quiet = 2.0;
+    let cell = size / (n as f32 + quiet * 2.0);
+    for y in 0..n {
+        for x in 0..n {
+            if colors[y * n + x] == qrcode::Color::Dark {
+                let min = rect.min + vec2((x as f32 + quiet) * cell, (y as f32 + quiet) * cell);
+                ui.painter().rect_filled(Rect::from_min_size(min, vec2(cell + 0.3, cell + 0.3)), 0.0, Color32::from_rgb(18, 18, 20));
+            }
+        }
+    }
+}
+
 /// Two overlapping windows: toggles the mini player.
 fn mini_button(ui: &mut Ui, active: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
