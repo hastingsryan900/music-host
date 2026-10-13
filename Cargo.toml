@@ -1,0 +1,32 @@
+[package]
+name = "music-host"
+version = "0.1.0"
+edition = "2021"
+description = "Music Host — a native, Apple Music–style player for your own music library"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "persistence"] }
+egui = "0.31"
+rodio = { version = "0.20", default-features = false }
+symphonia = { version = "0.5", features = ["all"] }
+lofty = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+dirs = "6"
+rand = "0.8"
+objc = "0.2"
+raw-window-handle = "0.6"
+ureq = { version = "2", features = ["json"] }
+souvlaki = "0.8"
+rubato = "0.16"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2
