@@ -76,6 +76,8 @@ enum Action {
     /// Look up an artist's full discography.
     FetchDiscography(String),
     FetchLyrics(TrackId),
+    ToggleMini,
+    ShowMain,
     ToggleLyrics,
     /// Download a whole album from an artist's discography.
     DownloadCatalogAlbum(crate::ytdl::CatalogAlbumRef),
@@ -120,6 +122,7 @@ struct UiState {
     show_link: bool,
     link_text: String,
     show_lyrics: bool,
+    show_mini: bool,
 }
 
 /// One "Add from Link" download, as shown in the window.
@@ -230,6 +233,7 @@ pub struct App {
     lyrics: HashMap<TrackId, Option<crate::lyrics::Lyrics>>,
     lyr_tx: std::sync::mpsc::Sender<(TrackId, crate::lyrics::Lyrics)>,
     lyr_rx: Receiver<(TrackId, crate::lyrics::Lyrics)>,
+    menubar: Option<crate::menubar::MenuBar>,
 }
 
 impl App {
@@ -311,6 +315,7 @@ impl App {
             lyrics: HashMap::new(),
             lyr_tx,
             lyr_rx,
+            menubar: if std::env::var("MH_SCREENSHOT").is_ok() || std::env::var("MH_FPS").is_ok() { None } else { crate::menubar::MenuBar::new(&cc.egui_ctx) },
             xmb: cc.gl.as_ref().and_then(|gl| match crate::xmb::Xmb::new(gl) {
                 Ok(x) => Some(Arc::new(Mutex::new(x))),
                 Err(e) => {
@@ -349,6 +354,7 @@ impl App {
             };
         }
         app.st.show_lyrics = std::env::var("MH_LYRICS").is_ok();
+        app.st.show_mini = std::env::var("MH_MINI").is_ok();
         // Test screenshots: MH_LINK=demo opens Add from Link with sample rows.
         if std::env::var("MH_LINK").as_deref() == Ok("demo") {
             app.st.show_link = true;
@@ -616,6 +622,13 @@ impl App {
                 Action::PlayNow(id) => {
                     self.player.play_next(id);
                     self.player.next(&self.lib);
+                }
+                Action::ToggleMini => self.st.show_mini = !self.st.show_mini,
+                Action::ShowMain => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    crate::menubar::activate();
                 }
                 Action::ToggleLyrics => {
                     self.st.show_lyrics = !self.st.show_lyrics;
@@ -942,6 +955,9 @@ impl App {
                     acts.push(Action::Go(View::Album(a.key.clone())));
                 }
             }
+            if cmd && i.modifiers.shift && i.key_pressed(Key::M) {
+                acts.push(Action::ToggleMini);
+            }
             if cmd && i.key_pressed(Key::P) {
                 acts.push(Action::Go(View::NowPlaying));
             }
@@ -1171,6 +1187,22 @@ impl eframe::App for App {
 
         let mut acts = vec![];
         self.handle_keys(ctx, &mut acts);
+        if let Some(mb) = &mut self.menubar {
+            use crate::menubar::Cmd;
+            let label = match self.player.current().and_then(|id| self.lib.track(id)) {
+                Some(t) => format!("{} — {}", t.title, t.artist),
+                None => String::new(),
+            };
+            mb.update(&label, playing);
+            match mb.poll() {
+                Some(Cmd::Toggle) => acts.push(Action::Toggle),
+                Some(Cmd::Next) => acts.push(Action::Next),
+                Some(Cmd::Prev) => acts.push(Action::Prev),
+                Some(Cmd::Show) => acts.push(Action::ShowMain),
+                Some(Cmd::Mini) => acts.push(Action::ToggleMini),
+                None => {}
+            }
+        }
 
         let title = match self.player.current().and_then(|id| self.lib.track(id)) {
             Some(t) => format!("{} — {}", t.title, t.artist),
@@ -1216,7 +1248,17 @@ impl eframe::App for App {
             child.multiply_opacity(view_t);
             child.set_clip_rect(full);
             v.main(&mut child);
+            // Test screenshots: MH_MINI_PREVIEW draws the mini player in the page.
+            if std::env::var("MH_MINI_PREVIEW").is_ok() {
+                let r = Rect::from_min_size(full.min + vec2(40.0, 40.0), vec2(380.0, 104.0));
+                ui.painter().rect_filled(r, cr(10), Color32::from_rgb(22, 22, 26));
+                let mut mui = ui.new_child(egui::UiBuilder::new().max_rect(r));
+                v.mini_contents(&mut mui, ctx);
+            }
         });
+        if v.st.show_mini {
+            v.mini_player(ctx);
+        }
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             drop_overlay(ctx, now);
         }
@@ -1517,6 +1559,9 @@ impl<'a> V<'a> {
                 let mut rui = ui.new_child(egui::UiBuilder::new().max_rect(right).layout(egui::Layout::right_to_left(egui::Align::Center)));
                 if glyph_toggle(&mut rui, "☰", self.st.show_queue, "Playing Next").clicked() {
                     self.st.show_queue = !self.st.show_queue;
+                }
+                if mini_button(&mut rui, self.st.show_mini).clicked() {
+                    self.acts.push(Action::ToggleMini);
                 }
                 rui.add_space(10.0);
                 let (_, f) = scrubber(&mut rui, 104.0, self.player.volume(), true, TEXT);
@@ -3245,6 +3290,97 @@ impl<'a> V<'a> {
         });
     }
 
+    /// Small always-on-top window: cover, title, transport, progress.
+    fn mini_player(&mut self, ctx: &Context) {
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Mini Player")
+            .with_inner_size([380.0, 104.0])
+            .with_resizable(false)
+            .with_always_on_top()
+            .with_title_shown(false)
+            .with_titlebar_shown(false)
+            .with_titlebar_buttons_shown(false)
+            .with_fullsize_content_view(true);
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("mini-player"), builder, |mctx, _| {
+            if mctx.input(|i| i.viewport().close_requested()) {
+                self.st.show_mini = false;
+            }
+            egui::CentralPanel::default().frame(egui::Frame::default().fill(Color32::from_rgb(22, 22, 26))).show(mctx, |ui| self.mini_contents(ui, mctx));
+        });
+    }
+
+    fn mini_contents(&mut self, ui: &mut Ui, mctx: &Context) {
+                let full = ui.max_rect();
+                // Drag anywhere that isn't a control to move the window.
+                let bg = ui.interact(full, ui.id().with("mini-drag"), Sense::click_and_drag());
+                if bg.drag_started() {
+                    mctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                let hovered = ui.rect_contains_pointer(full);
+                let cur = self.player.current().and_then(|id| self.lib.track(id)).cloned();
+                let art = Rect::from_min_size(full.min + vec2(12.0, 12.0), vec2(80.0, 80.0));
+                match cur.as_ref().and_then(|t| self.lib.album_of(t.id)).cloned() {
+                    Some(a) => {
+                        self.album_art(ui, &a, art, 8);
+                    }
+                    None => placeholder(ui, art, 8, "", false),
+                }
+                let tx = art.right() + 14.0;
+                let tw = full.right() - tx - 34.0;
+                let (title, artist) = match &cur {
+                    Some(t) => (t.title.clone(), t.artist.clone()),
+                    None => ("Not Playing".into(), String::new()),
+                };
+                text(ui, pos2(tx, full.top() + 14.0), &title, bold(14.0), TEXT, tw);
+                text(ui, pos2(tx, full.top() + 33.0), &artist, font(12.5), DIM, tw);
+
+                let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(tx - 6.0, full.top() + 50.0), vec2(160.0, 36.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                cui.spacing_mut().item_spacing.x = 6.0;
+                if icon_button(&mut cui, Icon::Prev, 16.0, 30.0).clicked() {
+                    self.acts.push(Action::Prev);
+                }
+                if play_button(&mut cui, self.player.is_playing(), 34.0).clicked() {
+                    self.acts.push(Action::Toggle);
+                }
+                if icon_button(&mut cui, Icon::Next, 16.0, 30.0).clicked() {
+                    self.acts.push(Action::Next);
+                }
+
+                // Progress line along the bottom of the text column.
+                if let Some(t) = &cur {
+                    let pos = self.player.position();
+                    let frac = if t.duration_secs > 0.0 { (pos / t.duration_secs) as f32 } else { 0.0 };
+                    let bar = Rect::from_min_max(pos2(tx, full.bottom() - 13.0), pos2(full.right() - 14.0, full.bottom() - 10.0));
+                    let resp = ui.interact(bar.expand2(vec2(0.0, 6.0)), ui.id().with("mini-seek"), Sense::click());
+                    ui.painter().rect_filled(bar, cr(2), Color32::from_rgb(52, 52, 58));
+                    let mut f = bar;
+                    f.set_right(bar.left() + bar.width() * frac.clamp(0.0, 1.0));
+                    ui.painter().rect_filled(f, cr(2), accent());
+                    if let Some(p) = resp.interact_pointer_pos().filter(|_| resp.clicked()) {
+                        self.acts.push(Action::Seek(((p.x - bar.left()) / bar.width()).clamp(0.0, 1.0) as f64 * t.duration_secs));
+                    }
+                    text_right(ui, pos2(full.right() - 14.0, full.bottom() - 32.0), &format!("-{}", fmt_time((t.duration_secs - pos).max(0.0))), font(11.0), FAINT);
+                }
+
+                // Hover: close (top-right) and "open the big window" buttons.
+                if hovered {
+                    let c = pos2(full.right() - 16.0, full.top() + 16.0);
+                    let r = ui.interact(Rect::from_center_size(c, vec2(22.0, 22.0)), ui.id().with("mini-close"), Sense::click());
+                    paint_x(ui, c, 4.5, if r.hovered() { TEXT } else { DIM });
+                    if r.on_hover_text("Close mini player").clicked() {
+                        self.st.show_mini = false;
+                    }
+                    let e = pos2(full.right() - 16.0, full.top() + 42.0);
+                    let r = ui.interact(Rect::from_center_size(e, vec2(22.0, 22.0)), ui.id().with("mini-expand"), Sense::click());
+                    let col = if r.hovered() { TEXT } else { DIM };
+                    let st = Stroke::new(1.5f32, col);
+                    ui.painter().rect_stroke(Rect::from_center_size(e, vec2(11.0, 9.0)), cr(2), st, egui::StrokeKind::Middle);
+                    if r.on_hover_text("Open Music Host").clicked() {
+                        self.acts.push(Action::ShowMain);
+                    }
+                }
+    }
+
     /// Lyrics beside the cover: synced lines scroll along with the song and
     /// the current one lights up; click a line to jump there.
     fn lyrics_panel(&mut self, ui: &mut Ui, r: Rect, t: &Track) {
@@ -3474,6 +3610,22 @@ fn section(ui: &mut Ui, s: &str) {
 }
 
 /// A small painted ✕ (the glyph isn't in the UI font).
+/// Two overlapping windows: toggles the mini player.
+fn mini_button(ui: &mut Ui, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
+    let on = anim(ui, resp.id.with("on"), active, 0.2);
+    let h = anim(ui, resp.id, resp.hovered(), 0.15);
+    let color = lerp(lerp(DIM, TEXT, h), accent(), on);
+    let st = Stroke::new(1.5f32, color);
+    let c = rect.center() - vec2(0.0, 2.0);
+    ui.painter().rect_stroke(Rect::from_center_size(c, vec2(16.0, 12.0)), cr(2), st, egui::StrokeKind::Middle);
+    ui.painter().rect_filled(Rect::from_min_size(c + vec2(0.0, 0.5), vec2(7.0, 5.0)), cr(1), color);
+    if on > 0.0 {
+        ui.painter().circle_filled(pos2(rect.center().x, rect.bottom() - 3.0), 2.0 * on, alpha(accent(), on));
+    }
+    resp.on_hover_text("Mini Player (⇧⌘M)").on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 fn paint_x(ui: &Ui, c: egui::Pos2, r: f32, color: Color32) {
     let st = Stroke::new(1.6f32, color);
     ui.painter().line_segment([c + vec2(-r, -r), c + vec2(r, r)], st);

@@ -11,6 +11,7 @@ mod library;
 mod loudness;
 mod lyrics;
 mod media;
+mod menubar;
 mod player;
 mod recommend;
 
