@@ -109,11 +109,8 @@ pub struct LibraryData {
 
 /// Today's local date as days since 1970-01-01.
 pub fn today() -> i64 {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let t: libc::time_t = now as libc::time_t;
-    unsafe { libc::localtime_r(&t, &mut tm) };
-    (now + tm.tm_gmtoff as i64).div_euclid(86400)
+    let now = chrono::Local::now();
+    (now.timestamp() + now.offset().local_minus_utc() as i64).div_euclid(86400)
 }
 
 /// (month 1-12, day 1-31) for days since 1970-01-01 (civil calendar).

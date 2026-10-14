@@ -107,17 +107,21 @@ pub fn setup_fonts(ctx: &egui::Context) {
         fd.index = index;
         Some(fd)
     };
-    if let Some(fd) = load("/System/Library/Fonts/SFNS.ttf", 0) {
+    #[cfg(windows)]
+    let (regular, bold, cjk) = (("C:\\Windows\\Fonts\\segoeui.ttf", 0), ("C:\\Windows\\Fonts\\segoeuib.ttf", 0), ("C:\\Windows\\Fonts\\YuGothM.ttc", 0));
+    #[cfg(not(windows))]
+    let (regular, bold, cjk) = (("/System/Library/Fonts/SFNS.ttf", 0), ("/System/Library/Fonts/HelveticaNeue.ttc", 1), ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0));
+    if let Some(fd) = load(regular.0, regular.1) {
         fonts.font_data.insert("sf".into(), Arc::new(fd));
         fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "sf".into());
     }
     let mut bold_family = vec![];
-    if let Some(fd) = load("/System/Library/Fonts/HelveticaNeue.ttc", 1) {
+    if let Some(fd) = load(bold.0, bold.1) {
         fonts.font_data.insert("sf-bold".into(), Arc::new(fd));
         bold_family.push("sf-bold".to_string());
     }
     // Japanese/Chinese fallback (kana + kanji), e.g. NieR composer names.
-    if let Some(fd) = load("/System/Library/Fonts/Hiragino Sans GB.ttc", 0) {
+    if let Some(fd) = load(cjk.0, cjk.1) {
         fonts.font_data.insert("cjk".into(), Arc::new(fd));
         fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("cjk".into());
     }

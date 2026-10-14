@@ -228,7 +228,7 @@ impl V<'_> {
             self.acts.push(Action::Go(View::Artists(Some(album.artist.clone()))));
             ui.close_menu();
         }
-        if ui.button("Show in Finder").clicked() {
+        if ui.button(REVEAL_LABEL).clicked() {
             if let Some(t) = self.lib.track(album.tracks[0]) {
                 self.acts.push(Action::Reveal(t.path.clone()));
             }
@@ -309,7 +309,7 @@ impl V<'_> {
                 self.acts.push(Action::Shuffle(album.tracks.clone()));
             }
             let missing = self.missing_tracks(&album);
-            if !missing.is_empty() && crate::ytdl::ytdlp_path().is_some() {
+            if !missing.is_empty() && crate::ytdl::downloader_available() {
                 let n = missing.len();
                 let tip = "Find the songs you don't have on YouTube and add them to this album";
                 let clicked = if tw >= 420.0 {
@@ -549,7 +549,7 @@ impl V<'_> {
                 self.acts.push(Action::Go(View::Artists(Some(t.album_artist.clone()))));
                 ui.close_menu();
             }
-            if ui.button("Show in Finder").clicked() {
+            if ui.button(REVEAL_LABEL).clicked() {
                 self.acts.push(Action::Reveal(t.path.clone()));
                 ui.close_menu();
             }

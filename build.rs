@@ -2,6 +2,11 @@
 // play. The binary stays self-contained either way.
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_opus)");
+    // On Windows, audiopus_sys builds and links libopus.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-cfg=has_opus");
+        return;
+    }
     for dir in ["/opt/homebrew/opt/opus/lib", "/usr/local/opt/opus/lib"] {
         if std::path::Path::new(dir).join("libopus.a").exists() {
             println!("cargo:rustc-link-search=native={dir}");

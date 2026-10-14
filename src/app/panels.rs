@@ -322,7 +322,7 @@ impl V<'_> {
                 });
                 ui.add_space(10.0);
 
-                if crate::ytdl::ytdlp_path().is_none() {
+                if !crate::ytdl::downloader_available() {
                     ui.label(egui::RichText::new("Needs yt-dlp — install it with: brew install yt-dlp").color(DIM));
                     return;
                 }
@@ -353,7 +353,11 @@ impl V<'_> {
                     }
                     if self.st.link_text.trim().is_empty() {
                         if pill(ui, None, "Paste", false).clicked() {
-                            if let Ok(out) = std::process::Command::new("pbpaste").output() {
+                            #[cfg(windows)]
+                            let paste = crate::ytdl::quiet(std::process::Command::new("powershell")).args(["-NoProfile", "-Command", "Get-Clipboard"]).output();
+                            #[cfg(not(windows))]
+                            let paste = std::process::Command::new("pbpaste").output();
+                            if let Ok(out) = paste {
                                 self.st.link_text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                             }
                         }

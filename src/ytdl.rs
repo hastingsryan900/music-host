@@ -53,18 +53,85 @@ pub struct LibrarySnapshot {
     pub albums: Vec<(String, String, String)>,
 }
 
+/// Don't flash a console window for helper processes on Windows.
+#[cfg_attr(not(windows), allow(unused_mut))]
+pub fn quiet(mut c: Command) -> Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
+}
+
+/// Where the Windows build keeps its own yt-dlp.exe and deno.exe.
+#[cfg(windows)]
+fn tools_dir() -> PathBuf {
+    let d = crate::library::app_dir().join("tools");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
 pub fn ytdlp_path() -> Option<PathBuf> {
-    ["/opt/homebrew/bin/yt-dlp", "/usr/local/bin/yt-dlp"]
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+    #[cfg(windows)]
+    let candidates = vec![tools_dir().join("yt-dlp.exe")];
+    #[cfg(not(windows))]
+    let candidates = vec![PathBuf::from("/opt/homebrew/bin/yt-dlp"), PathBuf::from("/usr/local/bin/yt-dlp")];
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// Windows: fetch yt-dlp (and deno, which YouTube now needs) on first use.
+/// On macOS they come from Homebrew.
+pub fn ensure_tools(status: &dyn Fn(&str)) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // One setup at a time even if several downloads start together.
+        static SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = SETUP.lock();
+        let dir = tools_dir();
+        let fetch = |url: &str, to: &Path| -> Result<(), String> {
+            let resp = ureq::get(url).timeout(Duration::from_secs(300)).call().map_err(|e| format!("couldn't download tools ({e})"))?;
+            let tmp = to.with_extension("part");
+            let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+            std::io::copy(&mut resp.into_reader(), &mut f).map_err(|e| e.to_string())?;
+            drop(f);
+            std::fs::rename(&tmp, to).map_err(|e| e.to_string())
+        };
+        let ytdlp = dir.join("yt-dlp.exe");
+        if !ytdlp.exists() {
+            status("Setting up downloader (one time)…");
+            fetch("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe", &ytdlp)?;
+        }
+        if !dir.join("deno.exe").exists() {
+            status("Setting up downloader (one time)…");
+            let zip = dir.join("deno.zip");
+            fetch("https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip", &zip)?;
+            // tar.exe ships with Windows 10+ and reads zip files.
+            let ok = quiet(Command::new("tar")).arg("-xf").arg(&zip).arg("-C").arg(&dir).status().map(|s| s.success()).unwrap_or(false);
+            let _ = std::fs::remove_file(&zip);
+            if !ok {
+                return Err("couldn't unpack deno".into());
+            }
+        }
+    }
+    let _ = status;
+    Ok(())
+}
+
+/// Whether link downloads can work here (Windows fetches its tools itself).
+pub fn downloader_available() -> bool {
+    cfg!(windows) || ytdlp_path().is_some()
 }
 
 fn ytdlp() -> Command {
-    let mut c = Command::new(ytdlp_path().unwrap_or_else(|| PathBuf::from("yt-dlp")));
-    // Apps launched from Finder get a minimal PATH; yt-dlp needs ffmpeg.
+    let _ = ensure_tools(&|_| {});
+    let mut c = quiet(Command::new(ytdlp_path().unwrap_or_else(|| PathBuf::from("yt-dlp"))));
     let path = std::env::var("PATH").unwrap_or_default();
+    // Apps launched from Finder get a minimal PATH; yt-dlp needs ffmpeg + deno.
+    #[cfg(not(windows))]
     c.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:{path}"));
+    #[cfg(windows)]
+    c.env("PATH", format!("{};{path}", tools_dir().display()));
     c.stdin(Stdio::null());
     c
 }
@@ -364,11 +431,6 @@ fn download_audio(
             "8",
             "--extractor-retries",
             "3",
-            "-f",
-            "bestaudio",
-            "-x",
-            "--audio-quality",
-            "0",
             "--quiet",
             "--no-warnings",
             "--progress",
@@ -381,7 +443,13 @@ fn download_audio(
             "-o",
         ]);
         cmd.arg(dir.join(format!("{stem}.%(ext)s")));
-        if let Some(cd) = split_chapters {
+        if cfg!(windows) {
+            // No ffmpeg on Windows: take YouTube's AAC stream as-is (.m4a).
+            cmd.args(["-f", "bestaudio[ext=m4a]/bestaudio"]);
+        } else {
+            cmd.args(["-f", "bestaudio", "-x", "--audio-quality", "0"]);
+        }
+        if let Some(cd) = split_chapters.filter(|_| !cfg!(windows)) {
             cmd.arg("--split-chapters");
             cmd.arg("-o");
             cmd.arg(format!("chapter:{}/%(section_number)02d %(section_title)s.%(ext)s", cd.display()));
@@ -397,6 +465,9 @@ fn download_audio(
             std::thread::spawn(move || {
                 while !done.load(std::sync::atomic::Ordering::Relaxed) {
                     if stopped(&cancel) {
+                        #[cfg(windows)]
+                        let _ = quiet(Command::new("taskkill")).args(["/PID", &pid.to_string(), "/T", "/F"]).status();
+                        #[cfg(not(windows))]
                         let _ = Command::new("kill").arg(pid.to_string()).status();
                         return;
                     }

@@ -12,6 +12,11 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 
 mod downloads;
+
+#[cfg(windows)]
+const REVEAL_LABEL: &str = "Show in Explorer";
+#[cfg(not(windows))]
+const REVEAL_LABEL: &str = "Show in Finder";
 mod library_ui;
 mod now_playing;
 mod panels;
@@ -590,6 +595,9 @@ impl App {
                     }
                 }
                 Action::Reveal(path) => {
+                    #[cfg(windows)]
+                    let _ = crate::ytdl::quiet(std::process::Command::new("explorer")).arg(format!("/select,{}", path.display())).spawn();
+                    #[cfg(not(windows))]
                     let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
                 }
                 Action::AddFolderDialog => {

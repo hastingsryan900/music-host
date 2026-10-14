@@ -16,6 +16,10 @@ mod player;
 mod recommend;
 mod stream;
 
+// Pulls in the libopus that audiopus_sys builds (see opus.rs).
+#[cfg(windows)]
+use audiopus_sys as _;
+
 fn main() -> eframe::Result<()> {
     let icon = image::load_from_memory(include_bytes!("../assets/icon.png"))
         .ok()

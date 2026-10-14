@@ -6,7 +6,7 @@ description = "Music Host — a native, Apple Music–style player for your own 
 
 [dependencies]
 qrcode = { version = "0.14", default-features = false }
-libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "persistence"] }
 egui = "0.31"
 rodio = { version = "0.20", default-features = false }
@@ -19,7 +19,6 @@ serde_json = "1"
 walkdir = "2"
 dirs = "6"
 rand = "0.8"
-objc = "0.2"
 raw-window-handle = "0.6"
 ureq = { version = "2", features = ["json"] }
 souvlaki = "0.8"
@@ -33,3 +32,10 @@ strip = true
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Builds libopus from source (CMake) so Ogg/Opus files play on Windows.
+audiopus_sys = "0.2"
