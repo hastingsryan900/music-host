@@ -36,6 +36,9 @@ opt-level = 2
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
 
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [target.'cfg(windows)'.dependencies]
 # Builds libopus from source (CMake) so Ogg/Opus files play on Windows.
 audiopus_sys = "0.2"

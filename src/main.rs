@@ -15,6 +15,7 @@ mod menubar;
 mod player;
 mod recommend;
 mod stream;
+mod update;
 
 // Pulls in the libopus that audiopus_sys builds (see opus.rs).
 #[cfg(windows)]

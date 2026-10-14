@@ -2,6 +2,19 @@
 // play. The binary stays self-contained either way.
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_opus)");
+    // Which commit this is (set by GitHub Actions), for the Windows updater.
+    println!("cargo:rerun-if-env-changed=GITHUB_SHA");
+    println!("cargo:rustc-env=MH_BUILD_SHA={}", std::env::var("GITHUB_SHA").unwrap_or_else(|_| "dev".into()));
+    // Windows: put the icon inside the .exe so Explorer and pinned taskbar
+    // shortcuts show it (the window icon alone only lasts while it runs).
+    #[cfg(windows)]
+    {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/icon.ico");
+        res.set("ProductName", "Music Host");
+        res.set("FileDescription", "Music Host");
+        res.compile().expect("embed Windows icon");
+    }
     // On Windows, audiopus_sys builds and links libopus.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rustc-cfg=has_opus");

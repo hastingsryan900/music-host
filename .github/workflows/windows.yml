@@ -29,6 +29,8 @@ jobs:
           Copy-Item target/release/music-host.exe "dist/MusicHost/Music Host.exe"
           Copy-Item README.md dist/MusicHost/
           Compress-Archive -Path dist/MusicHost/* -DestinationPath dist/MusicHost-Windows.zip -Force
+          # The app compares this with its own build to offer updates.
+          Set-Content -NoNewline -Path dist/version.txt -Value "${{ github.sha }}"
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -43,4 +45,6 @@ jobs:
             click **More info → Run anyway**.
 
             Built from ${{ github.sha }}.
-          files: dist/MusicHost-Windows.zip
+          files: |
+            dist/MusicHost-Windows.zip
+            dist/version.txt

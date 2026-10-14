@@ -141,6 +141,32 @@ impl V<'_> {
         }
     }
 
+    /// "Update available" card above the sidebar footer (Windows builds).
+    fn update_banner(&mut self, ui: &mut Ui) {
+        use crate::update::State;
+        let (title, sub, clickable) = match self.update {
+            State::Idle => return,
+            State::Available(_) => ("Update available", "Click to install and restart", true),
+            State::Installing => ("Updating…", "Downloading the new version", false),
+            State::Ready => ("Restarting…", "", false),
+            State::Failed(_) => ("Update failed", "Click to try again", true),
+        };
+        let w = ui.available_width();
+        let (r, resp) = ui.allocate_exact_size(vec2(w, 50.0), if clickable { Sense::click() } else { Sense::hover() });
+        let h = anim(ui, resp.id, resp.hovered() && clickable, 0.15);
+        ui.painter().rect_filled(r, cr(10), lerp(alpha(accent(), 0.85), accent(), h));
+        let tc = on_accent();
+        ui.painter().text(r.left_top() + vec2(12.0, 9.0), Align2::LEFT_TOP, title, bold(13.5), tc);
+        ui.painter().text(r.left_top() + vec2(12.0, 28.0), Align2::LEFT_TOP, sub, font(11.5), alpha(tc, 0.8));
+        if !clickable {
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && clickable {
+            self.acts.push(Action::InstallUpdate);
+        }
+        ui.add_space(8.0);
+    }
+
     pub(super) fn sidebar(&mut self, ctx: &Context, scan: Option<(usize, usize)>, can_back: bool) {
         egui::SidePanel::left("sidebar")
             .exact_width(230.0)
@@ -241,6 +267,7 @@ impl V<'_> {
 
                 // Footer: scan status + folders.
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    self.update_banner(ui);
                     ui.horizontal(|ui| {
                         if let Some((done, total)) = scan {
                             ui.spinner();

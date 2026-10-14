@@ -91,6 +91,8 @@ enum Action {
     ShowMain,
     /// Turn "Listen on your iPhone" on or off.
     SetStream(bool),
+    /// Download and install the newer build, then restart.
+    InstallUpdate,
     ToggleLyrics,
     /// Download a whole album from an artist's discography.
     DownloadCatalogAlbum(crate::ytdl::CatalogAlbumRef),
@@ -187,6 +189,7 @@ struct V<'a> {
     lyrics: &'a HashMap<TrackId, Option<crate::lyrics::Lyrics>>,
     /// Phone streaming: Ok(url) while on, Err(reason) if it couldn't start.
     stream: Option<Result<&'a str, &'a str>>,
+    update: &'a crate::update::State,
 }
 
 pub struct App {
@@ -250,6 +253,9 @@ pub struct App {
     lyr_rx: Receiver<(TrackId, crate::lyrics::Lyrics)>,
     menubar: Option<crate::menubar::MenuBar>,
     stream: Option<Result<crate::stream::Server, String>>,
+    update: crate::update::State,
+    update_tx: std::sync::mpsc::Sender<crate::update::Msg>,
+    update_rx: Receiver<crate::update::Msg>,
 }
 
 impl App {
@@ -262,6 +268,7 @@ impl App {
         let (tl_tx, tl_rx) = channel();
         let (disco_tx, disco_rx) = channel();
         let (lyr_tx, lyr_rx) = channel();
+        let (update_tx, update_rx) = channel();
         // One worker measures loudness, a song at a time.
         let (loud_tx, loud_jobs) = channel::<(TrackId, PathBuf)>();
         let (loud_res_tx, loud_rx) = channel();
@@ -332,6 +339,9 @@ impl App {
             lyr_tx,
             lyr_rx,
             stream: None,
+            update: crate::update::State::Idle,
+            update_tx: update_tx.clone(),
+            update_rx,
             menubar: if std::env::var("MH_SCREENSHOT").is_ok() || std::env::var("MH_FPS").is_ok() { None } else { crate::menubar::MenuBar::new(&cc.egui_ctx) },
             xmb: cc.gl.as_ref().and_then(|gl| match crate::xmb::Xmb::new(gl) {
                 Ok(x) => Some(Arc::new(Mutex::new(x))),
@@ -409,6 +419,17 @@ impl App {
             app.st.show_queue = std::env::var("MH_QUEUE").is_ok();
         }
         app.player.level_volume = app.lib.data.level_volume.unwrap_or(true);
+        // Windows: clear out the last version and look for a newer one.
+        if crate::update::supported() && std::env::var("MH_SCREENSHOT").is_err() {
+            crate::update::cleanup();
+            let (tx, wake) = (update_tx, cc.egui_ctx.clone());
+            std::thread::spawn(move || {
+                if let Some(v) = crate::update::check() {
+                    let _ = tx.send(crate::update::Msg::Available(v));
+                    wake.request_repaint();
+                }
+            });
+        }
         if app.lib.data.stream == Some(true) && std::env::var("MH_SCREENSHOT").is_err() {
             app.stream = Some(crate::stream::Server::start(app.stream_catalog()));
         }
@@ -657,6 +678,20 @@ impl App {
                     self.player.next(&self.lib);
                 }
                 Action::ToggleMini => self.st.show_mini = !self.st.show_mini,
+                Action::InstallUpdate => {
+                    if matches!(self.update, crate::update::State::Available(_) | crate::update::State::Failed(_)) {
+                        self.update = crate::update::State::Installing;
+                        let (tx, wake) = (self.update_tx.clone(), ctx.clone());
+                        std::thread::spawn(move || {
+                            let msg = match crate::update::install() {
+                                Ok(()) => crate::update::Msg::Installed,
+                                Err(e) => crate::update::Msg::Failed(e),
+                            };
+                            let _ = tx.send(msg);
+                            wake.request_repaint();
+                        });
+                    }
+                }
                 Action::SetStream(on) => {
                     self.lib.data.stream = Some(on);
                     self.lib.mark_dirty();
@@ -971,6 +1006,24 @@ impl eframe::App for App {
         self.pump_scan(ctx);
         self.pump_links(ctx);
         self.pump_loudness();
+        while let Ok(m) = self.update_rx.try_recv() {
+            use crate::update::{Msg, State};
+            match m {
+                Msg::Available(v) => self.update = State::Available(v),
+                Msg::Failed(e) => {
+                    self.toast(ctx, format!("Update failed: {e}"));
+                    self.update = State::Failed(e);
+                }
+                Msg::Installed => {
+                    // Save everything, start the new version, close this one.
+                    self.update = State::Ready;
+                    self.lib.mark_dirty();
+                    self.lib.save_if_dirty();
+                    crate::update::relaunch();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
         if let Some(name) = self.player.device_changed.take() {
             if std::env::var("MH_DEVTEST").is_ok() {
                 eprintln!("device switch → {name}: resumed {:?} at {:.2}s, playing={}", self.player.current(), self.player.position(), self.player.is_playing());
@@ -1060,6 +1113,7 @@ impl eframe::App for App {
             album_jobs: &self.album_jobs,
             lyrics: &self.lyrics,
             stream: self.stream.as_ref().map(|s| s.as_ref().map(|s| s.url.as_str()).map_err(|e| e.as_str())),
+            update: &self.update,
         };
         v.player_bar(ctx, self.track_at);
         v.sidebar(ctx, self.scan_progress, !self.history.is_empty());
