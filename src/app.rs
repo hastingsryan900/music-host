@@ -280,7 +280,7 @@ impl App {
             .ok();
         let mut app = App {
             art: ArtCache::new(&cc.egui_ctx),
-            media: if std::env::var("MH_SCREENSHOT").is_ok() || std::env::var("MH_FPS").is_ok() { None } else { Media::new() },
+            media: if std::env::var("MH_SCREENSHOT").is_ok() || std::env::var("MH_FPS").is_ok() { None } else { Media::new(window_hwnd(cc)) },
             lib,
             player,
             view: View::RecentlyAdded,
@@ -1159,6 +1159,25 @@ impl eframe::App for App {
 
 /// Is any part of our window actually visible? (macOS occlusion state.)
 /// Lets the animated backdrop stop rendering when nobody can see it.
+/// The native window handle on Windows (media controls need it).
+fn window_hwnd(cc: &eframe::CreationContext<'_>) -> Option<*mut std::ffi::c_void> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(h) = cc.window_handle() {
+            if let RawWindowHandle::Win32(w) = h.as_raw() {
+                return Some(w.hwnd.get() as *mut std::ffi::c_void);
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cc;
+        None
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[allow(unexpected_cfgs)] // from the objc macros
 fn window_on_screen(frame: &eframe::Frame) -> bool {

@@ -24,13 +24,14 @@ pub struct Media {
 }
 
 impl Media {
-    pub fn new() -> Option<Self> {
-        let mut controls = MediaControls::new(PlatformConfig {
-            dbus_name: "music_host",
-            display_name: "Music Host",
-            hwnd: None,
-        })
-        .ok()?;
+    /// `hwnd` is the main window's handle; Windows needs it, macOS doesn't.
+    pub fn new(hwnd: Option<*mut std::ffi::c_void>) -> Option<Self> {
+        if cfg!(windows) && hwnd.is_none() {
+            return None;
+        }
+        let config = PlatformConfig { dbus_name: "music_host", display_name: "Music Host", hwnd };
+        // Media keys are a nice-to-have: never let them stop the app opening.
+        let mut controls = std::panic::catch_unwind(move || MediaControls::new(config)).ok()?.ok()?;
         let (tx, rx) = channel();
         controls
             .attach(move |e| {
