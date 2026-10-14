@@ -19,6 +19,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release
+        env:
+          # libopus's bundled CMakeLists predates CMake 4's minimum.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
       - name: Package
         shell: pwsh
         run: |
