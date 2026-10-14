@@ -9,7 +9,7 @@
 //! tracks.
 
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1427,5 +1427,158 @@ mod tests {
         let (a, t, _) = identify(&v);
         assert_eq!(a, "Nujabes");
         assert_eq!(t, "Feather (feat. Cise Starr & Akin from CYNE)");
+    }
+}
+
+// ---------------------------------------------------------------- Store
+
+/// A song in the store's search results.
+#[derive(Clone, Debug)]
+pub struct StoreSong {
+    pub track: CatalogTrack,
+    pub album: String,
+    pub album_artist: String,
+    pub album_id: u64,
+    pub year: Option<u32>,
+    pub genre: Option<String>,
+    pub cover_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StoreResults {
+    pub artists: Vec<String>,
+    pub albums: Vec<CatalogAlbumRef>,
+    pub songs: Vec<StoreSong>,
+}
+
+fn itunes_search(term: &str, entity: &str, limit: u32) -> Vec<Value> {
+    let url = format!("https://itunes.apple.com/search?term={}&entity={entity}&limit={limit}", url_encode(term));
+    ureq::get(&url)
+        .timeout(Duration::from_secs(10))
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<Value>().ok())
+        .and_then(|v| v.get("results").and_then(|r| r.as_array()).cloned())
+        .unwrap_or_default()
+}
+
+/// Search Apple's catalogue for artists, albums and songs (for the Store).
+/// None if the catalogue couldn't be reached.
+pub fn store_search(term: &str) -> Option<StoreResults> {
+    let t = term.to_string();
+    let (a, b, c) = (t.clone(), t.clone(), t);
+    // The three lookups run side by side.
+    let artists = std::thread::spawn(move || itunes_search(&a, "musicArtist", 6));
+    let albums = std::thread::spawn(move || itunes_search(&b, "album", 30));
+    let songs = std::thread::spawn(move || itunes_search(&c, "song", 30));
+    let (artists, albums, songs) = (artists.join().ok()?, albums.join().ok()?, songs.join().ok()?);
+    if artists.is_empty() && albums.is_empty() && songs.is_empty() && !fetch_reachable() {
+        return None;
+    }
+    let mut out = StoreResults::default();
+    for r in &artists {
+        if let Some(name) = get_str(r, "artistName") {
+            if !out.artists.iter().any(|a| a == name) {
+                out.artists.push(name.to_string());
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    for r in &albums {
+        let title = get_str(r, "collectionName").unwrap_or("").to_string();
+        let artist = get_str(r, "artistName").unwrap_or("").to_string();
+        // One entry per release (skip clean duplicates of explicit albums).
+        if !seen.insert(format!("{}|{}", norm(&artist), base_album(&title))) {
+            continue;
+        }
+        out.albums.push(CatalogAlbumRef {
+            id: r.get("collectionId").and_then(|v| v.as_u64()).unwrap_or(0),
+            title,
+            artist,
+            year: get_str(r, "releaseDate").and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()),
+            track_count: r.get("trackCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            cover_url: get_str(r, "artworkUrl100").map(|u| u.replace("100x100bb", "600x600bb")),
+        });
+    }
+    // Albums the matching songs come from (Apple's album search often misses
+    // them), ranked by how many of the songs they hold.
+    let mut hits: HashMap<u64, usize> = HashMap::new();
+    for r in &songs {
+        if let Some(id) = r.get("collectionId").and_then(|v| v.as_u64()) {
+            *hits.entry(id).or_default() += 1;
+        }
+    }
+    for r in &songs {
+        let id = r.get("collectionId").and_then(|v| v.as_u64()).unwrap_or(0);
+        let title = get_str(r, "collectionName").unwrap_or("").to_string();
+        let artist = get_str(r, "collectionArtistName").or(get_str(r, "artistName")).unwrap_or("").to_string();
+        let count = r.get("trackCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        if id == 0 || count <= 3 || out.albums.iter().any(|a| a.id == id) {
+            continue;
+        }
+        if !seen.insert(format!("{}|{}", norm(&artist), base_album(&title))) {
+            continue;
+        }
+        out.albums.push(CatalogAlbumRef {
+            id,
+            title,
+            artist,
+            year: get_str(r, "releaseDate").and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()),
+            track_count: count,
+            cover_url: get_str(r, "artworkUrl100").map(|u| u.replace("100x100bb", "600x600bb")),
+        });
+    }
+    out.albums.sort_by_key(|a| std::cmp::Reverse(hits.get(&a.id).copied().unwrap_or(0)));
+    let mut seen = HashSet::new();
+    for r in &songs {
+        let Some(title) = get_str(r, "trackName") else { continue };
+        let artist = get_str(r, "artistName").unwrap_or("").to_string();
+        if !seen.insert(format!("{}|{}", norm(&artist), norm(title))) {
+            continue;
+        }
+        out.songs.push(StoreSong {
+            track: CatalogTrack {
+                title: title.to_string(),
+                artist: artist.clone(),
+                track: r.get("trackNumber").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+                disc: r.get("discNumber").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+                duration_ms: r.get("trackTimeMillis").and_then(|v| v.as_u64()).unwrap_or(0),
+            },
+            album: get_str(r, "collectionName").unwrap_or("").to_string(),
+            album_artist: get_str(r, "collectionArtistName").unwrap_or(&artist).to_string(),
+            album_id: r.get("collectionId").and_then(|v| v.as_u64()).unwrap_or(0),
+            year: get_str(r, "releaseDate").and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()),
+            genre: get_str(r, "primaryGenreName").map(String::from),
+            cover_url: get_str(r, "artworkUrl100").map(|u| u.replace("100x100bb", "300x300bb")),
+        });
+    }
+    Some(out)
+}
+
+/// Where a store song should be saved, and the request to fetch it.
+pub fn store_song_request(s: &StoreSong, root: &Path, lib: &LibrarySnapshot) -> TrackRequest {
+    let mut album = CatalogAlbum {
+        tracks: vec![s.track.clone()],
+        year: s.year,
+        genre: s.genre.clone(),
+        id: Some(s.album_id),
+        title: s.album.clone(),
+        artist: s.album_artist.clone(),
+        cover_url: s.cover_url.clone(),
+    };
+    let (dir, _) = fit_to_library(&mut album, root, lib);
+    TrackRequest { track: s.track.clone(), album: album.title, album_artist: album.artist, year: s.year, genre: s.genre.clone(), dir }
+}
+
+#[cfg(test)]
+mod store_tests {
+    #[test]
+    #[ignore]
+    fn live_store_search() {
+        let r = super::store_search("nujabes modal soul").expect("reachable");
+        eprintln!("artists {:?}", r.artists);
+        eprintln!("albums {:?}", r.albums.iter().map(|a| &a.title).collect::<Vec<_>>());
+        eprintln!("songs {:?}", r.songs.iter().map(|s| (&s.track.title, &s.album)).collect::<Vec<_>>());
+        assert!(r.albums.iter().any(|a| a.title.contains("Modal Soul")));
     }
 }

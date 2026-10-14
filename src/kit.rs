@@ -365,6 +365,7 @@ pub enum NavIcon {
     Songs,
     Loved,
     Stats,
+    Store,
     Playlist,
 }
 
@@ -404,6 +405,17 @@ pub fn nav_icon(ui: &Ui, icon: NavIcon, c: Pos2, color: Color32) {
         }
         NavIcon::Loved => {
             p.text(c + vec2(0.0, 0.5), Align2::CENTER_CENTER, "♥", font(14.0), color);
+        }
+        NavIcon::Store => {
+            // Shopping bag.
+            p.rect_stroke(Rect::from_min_max(c + vec2(-6.5, -3.0), c + vec2(6.5, 7.0)), cr(2), st, egui::StrokeKind::Middle);
+            let handle: Vec<Pos2> = (0..=10)
+                .map(|i| {
+                    let a = std::f32::consts::PI * (1.0 + i as f32 / 10.0);
+                    c + vec2(0.0, -3.0) + vec2(a.cos() * 3.5, a.sin() * 4.0)
+                })
+                .collect();
+            p.add(Shape::line(handle, st));
         }
         NavIcon::Stats => {
             for (i, h) in [5.0, 9.0, 13.0].iter().enumerate() {

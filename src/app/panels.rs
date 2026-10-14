@@ -213,6 +213,9 @@ impl V<'_> {
                     self.nav(ui, NavIcon::Songs, "Songs", View::Songs);
                     self.nav(ui, NavIcon::Loved, "Loved", View::Loved);
                     self.nav(ui, NavIcon::Stats, "Listening", View::Stats);
+                    if self.nav(ui, NavIcon::Store, "Store", View::Store).clicked() {
+                        self.st.store_focus = true;
+                    }
                     ui.add_space(16.0);
 
                     ui.horizontal(|ui| {

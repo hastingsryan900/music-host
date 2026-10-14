@@ -21,6 +21,8 @@ mod library_ui;
 mod now_playing;
 mod panels;
 mod stats;
+mod store;
+use store::{StoreData, StoreMsg};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, PartialEq, Debug)]
@@ -32,6 +34,7 @@ pub enum View {
     Songs,
     Loved,
     Stats,
+    Store,
     Album(String),
     Playlist(u64),
     Search,
@@ -93,6 +96,9 @@ enum Action {
     SetStream(bool),
     /// Download and install the newer build, then restart.
     InstallUpdate,
+    StoreSearch(String),
+    StoreOpenAlbum(u64),
+    StoreGetSong(crate::ytdl::StoreSong),
     ToggleLyrics,
     /// Download a whole album from an artist's discography.
     DownloadCatalogAlbum(crate::ytdl::CatalogAlbumRef),
@@ -138,6 +144,12 @@ struct UiState {
     link_text: String,
     show_lyrics: bool,
     show_mini: bool,
+    store_query: String,
+    store_submitted: String,
+    store_typed_at: f64,
+    store_focus: bool,
+    store_album: Option<u64>,
+    store_artist: Option<String>,
 }
 
 /// One "Add from Link" download, as shown in the window.
@@ -190,6 +202,7 @@ struct V<'a> {
     /// Phone streaming: Ok(url) while on, Err(reason) if it couldn't start.
     stream: Option<Result<&'a str, &'a str>>,
     update: &'a crate::update::State,
+    store: &'a StoreData,
 }
 
 pub struct App {
@@ -256,6 +269,9 @@ pub struct App {
     update: crate::update::State,
     update_tx: std::sync::mpsc::Sender<crate::update::Msg>,
     update_rx: Receiver<crate::update::Msg>,
+    store: StoreData,
+    store_tx: std::sync::mpsc::Sender<StoreMsg>,
+    store_rx: Receiver<StoreMsg>,
 }
 
 impl App {
@@ -269,6 +285,7 @@ impl App {
         let (disco_tx, disco_rx) = channel();
         let (lyr_tx, lyr_rx) = channel();
         let (update_tx, update_rx) = channel();
+        let (store_tx, store_rx) = channel();
         // One worker measures loudness, a song at a time.
         let (loud_tx, loud_jobs) = channel::<(TrackId, PathBuf)>();
         let (loud_res_tx, loud_rx) = channel();
@@ -342,6 +359,9 @@ impl App {
             update: crate::update::State::Idle,
             update_tx: update_tx.clone(),
             update_rx,
+            store: StoreData::default(),
+            store_tx,
+            store_rx,
             menubar: if std::env::var("MH_SCREENSHOT").is_ok() || std::env::var("MH_FPS").is_ok() { None } else { crate::menubar::MenuBar::new(&cc.egui_ctx) },
             xmb: cc.gl.as_ref().and_then(|gl| match crate::xmb::Xmb::new(gl) {
                 Ok(x) => Some(Arc::new(Mutex::new(x))),
@@ -367,6 +387,17 @@ impl App {
                 "songs" => View::Songs,
                 "now" => View::NowPlaying,
                 "stats" => View::Stats,
+                v if v.starts_with("store:") => {
+                    app.st.store_query = v[6..].to_string();
+                    app.st.store_submitted = v[6..].to_string();
+                    app.store_search(&cc.egui_ctx, v[6..].to_string());
+                    View::Store
+                }
+                "store" => View::Store,
+                v if v.starts_with("storealbum:") => {
+                    app.st.store_album = v[11..].parse().ok();
+                    View::Store
+                }
                 "settings" => {
                     app.st.show_folders = true;
                     if std::env::var("MH_STREAM").is_ok() {
@@ -678,6 +709,9 @@ impl App {
                     self.player.next(&self.lib);
                 }
                 Action::ToggleMini => self.st.show_mini = !self.st.show_mini,
+                Action::StoreSearch(q) => self.store_search(ctx, q),
+                Action::StoreOpenAlbum(id) => self.store_album(ctx, id),
+                Action::StoreGetSong(s) => self.store_get_song(ctx, s),
                 Action::InstallUpdate => {
                     if matches!(self.update, crate::update::State::Available(_) | crate::update::State::Failed(_)) {
                         self.update = crate::update::State::Installing;
@@ -1006,6 +1040,7 @@ impl eframe::App for App {
         self.pump_scan(ctx);
         self.pump_links(ctx);
         self.pump_loudness();
+        self.pump_store();
         while let Ok(m) = self.update_rx.try_recv() {
             use crate::update::{Msg, State};
             match m {
@@ -1114,6 +1149,7 @@ impl eframe::App for App {
             lyrics: &self.lyrics,
             stream: self.stream.as_ref().map(|s| s.as_ref().map(|s| s.url.as_str()).map_err(|e| e.as_str())),
             update: &self.update,
+            store: &self.store,
         };
         v.player_bar(ctx, self.track_at);
         v.sidebar(ctx, self.scan_progress, !self.history.is_empty());
@@ -1422,6 +1458,7 @@ impl<'a> V<'a> {
                 }
             }
             View::Stats => self.stats(ui),
+            View::Store => self.store(ui),
             View::Album(key) => self.album_page(ui, &key),
             View::Playlist(id) => {
                 let Some(pl) = self.lib.data.playlists.iter().find(|pl| pl.id == id) else { return };
