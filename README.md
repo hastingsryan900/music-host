@@ -1,8 +1,17 @@
 # Music Host
 
-A native macOS music player for your own library, written in Rust (egui + Symphonia). It works like Apple Music, in dark mode, and the accent color follows whatever album is playing.
+A native music player for your own library, for macOS and Windows, written in Rust (egui + Symphonia). It works like Apple Music, in dark mode, and the accent color follows whatever album is playing.
 
-## Install / update
+## Windows
+
+1. Download **MusicHost-Windows.zip** from the [latest release](https://github.com/hastingsryan900/music-host/releases/latest).
+2. Unzip it and run **Music Host.exe**.
+3. If Windows shows "Windows protected your PC", click **More info → Run anyway**. The app isn't code-signed, so Windows warns about it.
+4. Click ⚙ → **Add Folder** and pick the folder with your music, or drag folders onto the window.
+
+The first time you use **Add from Link**, the app downloads yt-dlp and deno (about 60 MB) into its data folder. Windows keeps the library in `%APPDATA%\Music Host\`. The macOS menu-bar item isn't available on Windows.
+
+## macOS install / update
 
 ```bash
 ./bundle.sh
