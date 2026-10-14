@@ -5,6 +5,10 @@ fn main() {
     // On Windows, audiopus_sys builds and links libopus.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rustc-cfg=has_opus");
+        // Windows gives the main thread only 1 MB of stack (macOS: 8 MB).
+        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+        }
         return;
     }
     for dir in ["/opt/homebrew/opt/opus/lib", "/usr/local/opt/opus/lib"] {
