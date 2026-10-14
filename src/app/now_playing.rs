@@ -42,8 +42,12 @@ impl V<'_> {
             lui.multiply_opacity(lyr_k);
             self.lyrics_panel(&mut lui, lyr, &t);
 
-            let art_size = (col_w * 0.82).min(inner.height() - 270.0).max(110.0);
-            let block_h = art_size + 270.0;
+            // Size the cover so cover + info + Lyrics/Next row always fit
+            // above the player bar (long titles wrap to two lines).
+            let title_h = ui.painter().layout(t.title.clone(), bold(28.0), TEXT, col_w - 36.0).size().y.min(70.0);
+            let info_h = title_h + 4.0 + 26.0 + 40.0 + 36.0 + 76.0 + 28.0;
+            let art_size = (col_w * 0.82).min(inner.height() - info_h - 24.0).max(100.0);
+            let block_h = art_size + 24.0 + info_h;
             let y0 = inner.top() + ((inner.height() - block_h) / 2.0).max(0.0);
             let art = Rect::from_min_size(pos2(inner.left() + (col_w - art_size) / 2.0, y0), vec2(art_size, art_size));
             self.np_art(ui, album.as_ref(), art);

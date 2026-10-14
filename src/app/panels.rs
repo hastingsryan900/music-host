@@ -6,19 +6,19 @@ use super::*;
 impl V<'_> {
     pub(super) fn player_bar(&mut self, ctx: &Context, track_at: f64) {
         egui::TopBottomPanel::bottom("player")
-            .exact_height(88.0)
+            .exact_height(70.0)
             .show_separator_line(false)
-            .frame(egui::Frame::default().fill(BAR).inner_margin(egui::Margin::symmetric(18, 10)))
+            .frame(egui::Frame::default().fill(BAR).inner_margin(egui::Margin::symmetric(16, 7)))
             .show(ctx, |ui| {
                 let full = ui.max_rect();
-                ui.painter().hline(full.x_range().expand(18.0), full.top() - 10.0, Stroke::new(1.0f32, LINE));
+                ui.painter().hline(full.x_range().expand(16.0), full.top() - 7.0, Stroke::new(1.0f32, LINE));
                 let cur = self.player.current().and_then(|id| self.lib.track(id)).cloned();
                 let since = (self.now - track_at) as f32;
                 let slide = ease(since / 0.45);
 
                 // ── Left: now playing.
                 let left_w = (full.width() * 0.3).min(360.0);
-                let art_rect = Rect::from_min_size(pos2(full.left(), full.center().y - 32.0), vec2(64.0, 64.0));
+                let art_rect = Rect::from_min_size(pos2(full.left(), full.center().y - 24.0), vec2(48.0, 48.0));
                 if let Some(t) = &cur {
                     let resp = ui.interact(art_rect, ui.id().with("np-art"), Sense::click());
                     let h = anim(ui, resp.id, resp.hovered(), 0.16);
@@ -32,19 +32,19 @@ impl V<'_> {
                     if resp.on_hover_text("Now Playing (⌘P)").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         self.acts.push(Action::Go(View::NowPlaying));
                     }
-                    let tx = art_rect.right() + 14.0;
+                    let tx = art_rect.right() + 12.0;
                     let w = full.left() + left_w - tx - 34.0;
                     let dy = (1.0 - slide) * 8.0;
-                    text(ui, pos2(tx, full.center().y - 19.0 + dy), &t.title, bold(14.0), alpha(TEXT, slide), w);
-                    let r = text(ui, pos2(tx, full.center().y + 2.0 + dy), &format!("{} — {}", t.artist, t.album), font(12.5), alpha(DIM, slide), w);
+                    text(ui, pos2(tx, full.center().y - 17.0 + dy), &t.title, bold(13.5), alpha(TEXT, slide), w);
+                    let r = text(ui, pos2(tx, full.center().y + 1.0 + dy), &format!("{} — {}", t.artist, t.album), font(12.0), alpha(DIM, slide), w);
                     let resp = ui.interact(r, ui.id().with("np-sub"), Sense::click());
                     if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         self.acts.push(Action::Go(View::Album(t.album_key())));
                     }
-                    self.heart(ui, t, pos2(full.left() + left_w - 14.0, full.center().y), 17.0);
+                    self.heart(ui, t, pos2(full.left() + left_w - 14.0, full.center().y), 16.0);
                 } else {
                     ui.painter().rect_filled(art_rect, cr(6), Color32::from_rgb(40, 40, 46));
-                    ui.painter().text(art_rect.center(), Align2::CENTER_CENTER, "♪", font(24.0), FAINT);
+                    ui.painter().text(art_rect.center(), Align2::CENTER_CENTER, "♪", font(20.0), FAINT);
                     text(ui, pos2(art_rect.right() + 14.0, full.center().y - 9.0), "Not Playing", font(14.0), DIM, 200.0);
                 }
 
@@ -54,18 +54,18 @@ impl V<'_> {
                 let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(center).layout(egui::Layout::top_down(egui::Align::Center)));
                 cui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    let total = 30.0 * 2.0 + 36.0 * 2.0 + 40.0 + 10.0 * 4.0;
+                    let total = 30.0 * 2.0 + 32.0 * 2.0 + 34.0 + 10.0 * 4.0;
                     ui.add_space(((cw - total) / 2.0).max(0.0));
                     if glyph_toggle(ui, "🔀", self.player.shuffle, "Shuffle").clicked() {
                         self.acts.push(Action::ToggleShuffle);
                     }
-                    if icon_button(ui, Icon::Prev, 17.0, 36.0).clicked() {
+                    if icon_button(ui, Icon::Prev, 15.0, 32.0).clicked() {
                         self.acts.push(Action::Prev);
                     }
-                    if play_button(ui, self.player.is_playing(), 40.0).clicked() {
+                    if play_button(ui, self.player.is_playing(), 34.0).clicked() {
                         self.acts.push(Action::Toggle);
                     }
-                    if icon_button(ui, Icon::Next, 17.0, 36.0).clicked() {
+                    if icon_button(ui, Icon::Next, 15.0, 32.0).clicked() {
                         self.acts.push(Action::Next);
                     }
                     let looping = self.player.repeat == Repeat::One;
@@ -73,9 +73,9 @@ impl V<'_> {
                         self.acts.push(Action::ToggleLoop);
                     }
                 });
-                cui.add_space(2.0);
+                cui.add_space(-3.0);
                 cui.horizontal(|ui| {
-                    self.progress_row(ui, cur.as_ref(), cw, 11.0);
+                    self.progress_row(ui, cur.as_ref(), cw, 10.5);
                 });
 
                 // ── Right: volume + queue.
@@ -169,7 +169,7 @@ impl V<'_> {
 
     pub(super) fn sidebar(&mut self, ctx: &Context, scan: Option<(usize, usize)>, can_back: bool) {
         egui::SidePanel::left("sidebar")
-            .exact_width(230.0)
+            .exact_width(196.0)
             .resizable(false)
             .show_separator_line(false)
             .frame(egui::Frame::default().fill(SIDEBAR).inner_margin(egui::Margin { left: 12, right: 12, top: 16, bottom: 10 }))

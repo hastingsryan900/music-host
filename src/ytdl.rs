@@ -544,6 +544,13 @@ pub struct CatalogAlbum {
     pub artist: String,
     #[serde(default)]
     pub cover_url: Option<String>,
+    #[serde(default)]
+    pub artist_id: Option<u64>,
+    /// "2016-08-20"
+    #[serde(default)]
+    pub release: Option<String>,
+    #[serde(default)]
+    pub copyright: Option<String>,
 }
 
 /// An album in an artist's catalogue (for the discography view).
@@ -670,6 +677,9 @@ pub fn album_by_id(id: u64) -> Option<CatalogAlbum> {
         title: get_str(coll, "collectionName").unwrap_or("").to_string(),
         artist: get_str(coll, "artistName").unwrap_or("").to_string(),
         cover_url: get_str(coll, "artworkUrl100").map(|u| u.replace("100x100bb", "1500x1500bb")),
+        artist_id: coll.get("artistId").and_then(|v| v.as_u64()),
+        release: get_str(coll, "releaseDate").and_then(|d| d.get(..10)).map(String::from),
+        copyright: get_str(coll, "copyright").map(String::from),
     })
 }
 
@@ -1081,7 +1091,7 @@ pub fn resolve_catalog_link(url: &str) -> Result<CatalogLink, String> {
         .and_then(|i| get_str(i, "url"))
         .map(String::from);
     let year = get_str(&e, "releaseDate").and_then(|d| d.get(..4)).and_then(|y| y.parse().ok());
-    Ok(CatalogLink::Album(CatalogAlbum { tracks, year, genre: None, id: None, title: name, artist, cover_url }))
+    Ok(CatalogLink::Album(CatalogAlbum { tracks, year, genre: None, id: None, title: name, artist, cover_url, artist_id: None, release: None, copyright: None }))
 }
 
 /// "https://open.spotify.com/intl-de/album/<id>?si=…" → ("album", id)
@@ -1444,9 +1454,16 @@ pub struct StoreSong {
     pub cover_url: Option<String>,
 }
 
+/// An artist in the store.
+#[derive(Clone, Debug)]
+pub struct StoreArtist {
+    pub id: u64,
+    pub name: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct StoreResults {
-    pub artists: Vec<String>,
+    pub artists: Vec<StoreArtist>,
     pub albums: Vec<CatalogAlbumRef>,
     pub songs: Vec<StoreSong>,
 }
@@ -1468,19 +1485,18 @@ pub fn store_search(term: &str) -> Option<StoreResults> {
     let t = term.to_string();
     let (a, b, c) = (t.clone(), t.clone(), t);
     // The three lookups run side by side.
-    let artists = std::thread::spawn(move || itunes_search(&a, "musicArtist", 6));
-    let albums = std::thread::spawn(move || itunes_search(&b, "album", 30));
-    let songs = std::thread::spawn(move || itunes_search(&c, "song", 30));
+    let artists = std::thread::spawn(move || itunes_search(&a, "musicArtist", 12));
+    let albums = std::thread::spawn(move || itunes_search(&b, "album", 50));
+    let songs = std::thread::spawn(move || itunes_search(&c, "song", 50));
     let (artists, albums, songs) = (artists.join().ok()?, albums.join().ok()?, songs.join().ok()?);
     if artists.is_empty() && albums.is_empty() && songs.is_empty() && !fetch_reachable() {
         return None;
     }
     let mut out = StoreResults::default();
     for r in &artists {
-        if let Some(name) = get_str(r, "artistName") {
-            if !out.artists.iter().any(|a| a == name) {
-                out.artists.push(name.to_string());
-            }
+        let (Some(name), Some(id)) = (get_str(r, "artistName"), r.get("artistId").and_then(|v| v.as_u64())) else { continue };
+        if !out.artists.iter().any(|a| a.id == id) {
+            out.artists.push(StoreArtist { id, name: name.to_string() });
         }
     }
     let mut seen = HashSet::new();
@@ -1565,13 +1581,246 @@ pub fn store_song_request(s: &StoreSong, root: &Path, lib: &LibrarySnapshot) -> 
         title: s.album.clone(),
         artist: s.album_artist.clone(),
         cover_url: s.cover_url.clone(),
+        artist_id: None,
+        release: None,
+        copyright: None,
     };
     let (dir, _) = fit_to_library(&mut album, root, lib);
     TrackRequest { track: s.track.clone(), album: album.title, album_artist: album.artist, year: s.year, genre: s.genre.clone(), dir }
 }
 
+/// A store artist page: photo, top songs, albums, singles & EPs.
+#[derive(Clone, Debug, Default)]
+pub struct ArtistPage {
+    pub name: String,
+    pub genre: Option<String>,
+    /// Apple Music artist photo, without the size suffix (see `sized`).
+    pub image: Option<String>,
+    pub top_songs: Vec<StoreSong>,
+    pub albums: Vec<CatalogAlbumRef>,
+    pub singles: Vec<CatalogAlbumRef>,
+}
+
+/// An Apple image URL at a given size, e.g. sized(base, "600x600cc.jpg").
+pub fn sized(base: &str, size: &str) -> String {
+    format!("{base}/{size}")
+}
+
+/// The artist's photo from their Apple Music page (cached on disk;
+/// the catalogue API doesn't include artist images).
+pub fn artist_image(id: u64) -> Option<String> {
+    let dir = crate::library::app_dir().join("artists");
+    let _ = std::fs::create_dir_all(&dir);
+    let cache = dir.join(format!("{id}.txt"));
+    if let Ok(meta) = std::fs::metadata(&cache) {
+        let fresh = meta.modified().ok().and_then(|m| m.elapsed().ok()).map(|e| e < Duration::from_secs(30 * 86400)).unwrap_or(false);
+        if fresh {
+            let s = std::fs::read_to_string(&cache).unwrap_or_default();
+            return (!s.trim().is_empty()).then(|| s.trim().to_string());
+        }
+    }
+    let html = ureq::get(&format!("https://music.apple.com/us/artist/{id}"))
+        .set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+        .timeout(Duration::from_secs(15))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let tag = "property=\"og:image\" content=\"";
+    let found = html.find(tag).and_then(|i| {
+        let rest = &html[i + tag.len()..];
+        let url = &rest[..rest.find('"')?];
+        // Strip the trailing "/1200x630cw.png" size so any size can be asked for.
+        let base = &url[..url.rfind('/')?];
+        // Apple's generic placeholder isn't a real photo.
+        (base.contains("mzstatic.com") && !base.contains("/Features")).then(|| base.to_string())
+    });
+    let _ = std::fs::write(&cache, found.clone().unwrap_or_default());
+    found
+}
+
+/// Everything for an artist's store page.
+pub fn artist_page(id: u64) -> Option<ArtistPage> {
+    let img = std::thread::spawn(move || artist_image(id));
+    let resp: Value = ureq::get(&format!("https://itunes.apple.com/lookup?id={id}&entity=album&limit=200")).timeout(Duration::from_secs(10)).call().ok()?.into_json().ok()?;
+    let results = resp.get("results")?.as_array()?;
+    let artist = results.iter().find(|r| get_str(r, "wrapperType") == Some("artist"))?;
+    let mut page = ArtistPage {
+        name: get_str(artist, "artistName").unwrap_or("").to_string(),
+        genre: get_str(artist, "primaryGenreName").map(String::from),
+        ..Default::default()
+    };
+    // One entry per release: prefer explicit, then the most complete edition.
+    let mut by_base: HashMap<String, (CatalogAlbumRef, bool, String)> = HashMap::new();
+    for r in results.iter().filter(|r| get_str(r, "wrapperType") == Some("collection")) {
+        let title = get_str(r, "collectionName").unwrap_or("").to_string();
+        let count = r.get("trackCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let clean = get_str(r, "collectionExplicitness") == Some("cleaned");
+        let date = get_str(r, "releaseDate").unwrap_or("").to_string();
+        let item = CatalogAlbumRef {
+            id: r.get("collectionId").and_then(|v| v.as_u64()).unwrap_or(0),
+            title: title.clone(),
+            artist: get_str(r, "artistName").unwrap_or(&page.name).to_string(),
+            year: date.get(..4).and_then(|y| y.parse().ok()),
+            track_count: count,
+            cover_url: get_str(r, "artworkUrl100").map(|u| u.replace("100x100bb", "600x600bb")),
+        };
+        let key = base_album(&title);
+        let better = match by_base.get(&key) {
+            None => true,
+            Some((old, old_clean, _)) => (*old_clean && !clean) || (old_clean == &clean && count > old.track_count),
+        };
+        if better {
+            by_base.insert(key, (item, clean, date));
+        }
+    }
+    let mut all: Vec<(CatalogAlbumRef, String)> = by_base.into_values().map(|(a, _, d)| (a, d)).collect();
+    all.sort_by(|a, b| b.1.cmp(&a.1));
+    for (a, _) in all {
+        let single = a.track_count <= 3 || a.title.ends_with(" - Single") || a.title.ends_with(" - EP") || a.track_count <= 6 && a.title.contains("EP");
+        if single {
+            page.singles.push(a);
+        } else {
+            page.albums.push(a);
+        }
+    }
+    // Top songs: Apple's search is ranked by popularity; keep the ones
+    // where this is the main artist (not just a feature).
+    {
+        let url = format!("https://itunes.apple.com/search?term={}&entity=song&attribute=artistTerm&limit=100", url_encode(&page.name));
+        let results = ureq::get(&url)
+            .timeout(Duration::from_secs(10))
+            .call()
+            .ok()
+            .and_then(|r| r.into_json::<Value>().ok())
+            .and_then(|v| v.get("results").and_then(|r| r.as_array()).cloned())
+            .unwrap_or_default();
+        let mut seen = HashSet::new();
+        for r in &results {
+            if r.get("artistId").and_then(|v| v.as_u64()) != Some(id) {
+                continue;
+            }
+            let Some(title) = get_str(r, "trackName") else { continue };
+            if !seen.insert(norm(&without_feat(title))) {
+                continue;
+            }
+            let artist = get_str(r, "artistName").unwrap_or("").to_string();
+            page.top_songs.push(StoreSong {
+                track: CatalogTrack {
+                    title: title.to_string(),
+                    artist: artist.clone(),
+                    track: r.get("trackNumber").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+                    disc: r.get("discNumber").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+                    duration_ms: r.get("trackTimeMillis").and_then(|v| v.as_u64()).unwrap_or(0),
+                },
+                album: get_str(r, "collectionName").unwrap_or("").to_string(),
+                album_artist: get_str(r, "collectionArtistName").unwrap_or(&artist).to_string(),
+                album_id: r.get("collectionId").and_then(|v| v.as_u64()).unwrap_or(0),
+                year: get_str(r, "releaseDate").and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()),
+                genre: get_str(r, "primaryGenreName").map(String::from),
+                cover_url: get_str(r, "artworkUrl100").map(|u| u.replace("100x100bb", "300x300bb")),
+            });
+        }
+        page.top_songs.truncate(20);
+    }
+    page.image = img.join().ok().flatten();
+    Some(page)
+}
+
+/// Apple's charts for the Store front page.
+#[derive(Clone, Debug, Default)]
+pub struct Charts {
+    pub albums: Vec<CatalogAlbumRef>,
+    pub songs: Vec<StoreSong>,
+}
+
+fn chart_ids(kind: &str, n: u32) -> Vec<Value> {
+    ureq::get(&format!("https://rss.marketingtools.apple.com/api/v2/us/music/most-played/{n}/{kind}.json"))
+        .set("User-Agent", "Mozilla/5.0")
+        .timeout(Duration::from_secs(15))
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<Value>().ok())
+        .and_then(|v| v.get("feed")?.get("results")?.as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// Turn a catalogue song record into a StoreSong.
+fn store_song_from(r: &Value) -> Option<StoreSong> {
+    let title = get_str(r, "trackName")?;
+    let artist = get_str(r, "artistName").unwrap_or("").to_string();
+    Some(StoreSong {
+        track: CatalogTrack {
+            title: title.to_string(),
+            artist: artist.clone(),
+            track: r.get("trackNumber").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+            disc: r.get("discNumber").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+            duration_ms: r.get("trackTimeMillis").and_then(|v| v.as_u64()).unwrap_or(0),
+        },
+        album: get_str(r, "collectionName").unwrap_or("").to_string(),
+        album_artist: get_str(r, "collectionArtistName").unwrap_or(&artist).to_string(),
+        album_id: r.get("collectionId").and_then(|v| v.as_u64()).unwrap_or(0),
+        year: get_str(r, "releaseDate").and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()),
+        genre: get_str(r, "primaryGenreName").map(String::from),
+        cover_url: get_str(r, "artworkUrl100").map(|u| u.replace("100x100bb", "300x300bb")),
+    })
+}
+
+/// Top albums and songs in the US right now.
+pub fn charts() -> Option<Charts> {
+    let songs = std::thread::spawn(|| {
+        // The chart only has ids; one batch lookup fills in album details.
+        let ids: Vec<String> = chart_ids("songs", 40).iter().filter_map(|r| get_str(r, "id").map(String::from)).collect();
+        if ids.is_empty() {
+            return vec![];
+        }
+        let v: Option<Value> = ureq::get(&format!("https://itunes.apple.com/lookup?id={}", ids.join(",")))
+            .timeout(Duration::from_secs(15))
+            .call()
+            .ok()
+            .and_then(|r| r.into_json().ok());
+        // Lookup returns them in the order asked, i.e. chart order.
+        v.and_then(|v| v.get("results")?.as_array().cloned()).unwrap_or_default().iter().filter_map(store_song_from).collect::<Vec<_>>()
+    });
+    let albums: Vec<CatalogAlbumRef> = chart_ids("albums", 50)
+        .iter()
+        .filter_map(|r| {
+            Some(CatalogAlbumRef {
+                id: get_str(r, "id")?.parse().ok()?,
+                title: get_str(r, "name")?.to_string(),
+                artist: get_str(r, "artistName").unwrap_or("").to_string(),
+                year: get_str(r, "releaseDate").and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()),
+                track_count: 0,
+                cover_url: get_str(r, "artworkUrl100").map(|u| u.replace("100x100bb", "600x600bb")),
+            })
+        })
+        .collect();
+    let songs = songs.join().unwrap_or_default();
+    (!albums.is_empty() || !songs.is_empty()).then_some(Charts { albums, songs })
+}
+
+/// Find an artist's catalogue id by name (for artists in your library).
+pub fn artist_id(name: &str) -> Option<u64> {
+    let n = norm(name);
+    itunes_search(name, "musicArtist", 5)
+        .iter()
+        .find(|r| norm(get_str(r, "artistName").unwrap_or("")) == n)
+        .and_then(|r| r.get("artistId").and_then(|v| v.as_u64()))
+}
+
 #[cfg(test)]
 mod store_tests {
+    #[test]
+    #[ignore]
+    fn live_artist_page() {
+        let p = super::artist_page(5869117).expect("lil wayne");
+        eprintln!("{} image={:?}", p.name, p.image);
+        eprintln!("albums {}: {:?}", p.albums.len(), p.albums.iter().map(|a| &a.title).collect::<Vec<_>>());
+        eprintln!("singles {}", p.singles.len());
+        eprintln!("top {:?}", p.top_songs.iter().map(|s| &s.track.title).take(10).collect::<Vec<_>>());
+        assert!(p.albums.len() > 10 && p.image.is_some());
+    }
+
     #[test]
     #[ignore]
     fn live_store_search() {
