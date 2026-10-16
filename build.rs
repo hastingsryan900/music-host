@@ -2,7 +2,7 @@
 // play. The binary stays self-contained either way.
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_opus)");
-    // Which commit this is (set by GitHub Actions), for the Windows updater.
+    // Which commit this is (set by GitHub Actions), for the updater.
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     println!("cargo:rustc-env=MH_BUILD_SHA={}", std::env::var("GITHUB_SHA").unwrap_or_else(|_| "dev".into()));
     // Windows: put the icon inside the .exe so Explorer and pinned taskbar

@@ -1,8 +1,9 @@
 #!/bin/zsh
 # Builds "Music Host.app" and installs it to ~/Applications.
+# `./bundle.sh --no-install` only builds dist/Music Host.app (used by CI).
 set -e
 cd "${0:h}"
-source "$HOME/.cargo/env"
+[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
 cargo build --release
 APP="dist/Music Host.app"
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -35,6 +36,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 codesign --force --deep -s - "$APP" 2>/dev/null || true
+[[ "$1" == "--no-install" ]] && { echo "Built: $APP"; exit 0; }
 
 mkdir -p "$HOME/Applications"
 rm -rf "$HOME/Applications/Music Host.app"

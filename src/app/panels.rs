@@ -141,7 +141,7 @@ impl V<'_> {
         }
     }
 
-    /// "Update available" card above the sidebar footer (Windows builds).
+    /// "Update available" card above the sidebar footer (release builds).
     fn update_banner(&mut self, ui: &mut Ui) {
         use crate::update::State;
         let (title, sub, clickable) = match self.update {

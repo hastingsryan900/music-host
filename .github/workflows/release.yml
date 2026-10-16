@@ -1,0 +1,97 @@
+# Builds the Mac and Windows apps on every push to main and publishes them as
+# the "latest" release, so friends always have one download link and the app's
+# updater always finds the newest build.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+        env:
+          # libopus's bundled CMakeLists predates CMake 4's minimum.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/MusicHost | Out-Null
+          Copy-Item target/release/music-host.exe "dist/MusicHost/Music Host.exe"
+          Copy-Item README.md dist/MusicHost/
+          Compress-Archive -Path dist/MusicHost/* -DestinationPath dist/MusicHost-Windows.zip -Force
+          # The app compares this with its own build to offer updates.
+          Set-Content -NoNewline -Path dist/version.txt -Value "${{ github.sha }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/MusicHost-Windows.zip
+            dist/version.txt
+
+  macos:
+    # Apple Silicon (M1 and newer).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libopus
+        run: brew install opus
+      - name: Build
+        run: ./bundle.sh --no-install
+      - name: Package
+        run: |
+          ditto -c -k --keepParent "dist/Music Host.app" dist/MusicHost-macOS.zip
+          # Separate from version.txt so a Mac never sees an update before its build is up.
+          printf '%s' "${{ github.sha }}" > dist/version-macos.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            dist/MusicHost-macOS.zip
+            dist/version-macos.txt
+
+  publish:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Music Host
+          prerelease: false
+          make_latest: true
+          body: |
+            ### Mac (Apple Silicon)
+            **Download `MusicHost-macOS.zip`**, open it, and drag **Music Host** into Applications.
+            The first time, macOS will refuse to open it because the app isn't from the App Store.
+            Click **Done**, then go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
+
+            ### Windows
+            **Download `MusicHost-Windows.zip`**, unzip it, and run **Music Host.exe**.
+            If Windows says "Windows protected your PC", click **More info → Run anyway**.
+
+            After that, the app shows **Update available** in the sidebar whenever there's a new version.
+
+            Built from ${{ github.sha }}.
+          files: |
+            dist/MusicHost-Windows.zip
+            dist/version.txt
+            dist/MusicHost-macOS.zip
+            dist/version-macos.txt

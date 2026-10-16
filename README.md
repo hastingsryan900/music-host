@@ -11,13 +11,26 @@ A native music player for your own library, for macOS and Windows, written in Ru
 
 The first time you use **Add from Link**, the app downloads yt-dlp and deno (about 60 MB) into its data folder. Windows keeps the library in `%APPDATA%\Music Host\`. The macOS menu-bar item isn't available on Windows.
 
-## macOS install / update
+## Mac (Apple Silicon)
+
+1. Download **MusicHost-macOS.zip** from the [latest release](https://github.com/hastingsryan900/music-host/releases/latest).
+2. Open the zip and drag **Music Host** into **Applications**.
+3. Open it. The first time, macOS says it can't check the app because it isn't from the App Store. Click **Done**, go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**. You only do this once.
+4. Click ⚙ → **Add Folder** and pick the folder with your music.
+
+When a new version is out, **Update available** shows in the sidebar. Click it and the app updates itself and restarts.
+
+## Publishing an update
+
+Push to `main`. GitHub Actions builds the Mac and Windows apps (about 10 minutes) and replaces the files on the `latest` release, and every installed copy then offers the update.
+
+## Building it yourself (macOS)
 
 ```bash
 ./bundle.sh
 ```
 
-This builds a release binary and installs **Music Host.app** to `~/Applications`.
+This builds a release binary and installs **Music Host.app** to `~/Applications`. Builds you make yourself don't update themselves; only the ones from GitHub do.
 
 ## Using it
 

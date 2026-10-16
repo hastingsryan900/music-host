@@ -452,7 +452,7 @@ impl App {
             app.st.show_queue = std::env::var("MH_QUEUE").is_ok();
         }
         app.player.level_volume = app.lib.data.level_volume.unwrap_or(true);
-        // Windows: clear out the last version and look for a newer one.
+        // Release builds: clear out the last version and look for a newer one.
         if crate::update::supported() && std::env::var("MH_SCREENSHOT").is_err() {
             crate::update::cleanup();
             let (tx, wake) = (update_tx, cc.egui_ctx.clone());
