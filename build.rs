@@ -31,6 +31,8 @@ fn main() {
             // Apple's linker picks the dylib, and the app then needs Homebrew.
             let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("opus");
             std::fs::create_dir_all(&out).unwrap();
+            // Homebrew's copy is read-only, so replace rather than overwrite.
+            let _ = std::fs::remove_file(out.join("libopus.a"));
             std::fs::copy(&lib, out.join("libopus.a")).unwrap();
             println!("cargo:rerun-if-changed={}", lib.display());
             println!("cargo:rustc-link-search=native={}", out.display());
