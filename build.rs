@@ -25,8 +25,15 @@ fn main() {
         return;
     }
     for dir in ["/opt/homebrew/opt/opus/lib", "/usr/local/opt/opus/lib"] {
-        if std::path::Path::new(dir).join("libopus.a").exists() {
-            println!("cargo:rustc-link-search=native={dir}");
+        let lib = std::path::Path::new(dir).join("libopus.a");
+        if lib.exists() {
+            // Link from a folder holding only the .a: next to libopus.dylib,
+            // Apple's linker picks the dylib, and the app then needs Homebrew.
+            let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("opus");
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::copy(&lib, out.join("libopus.a")).unwrap();
+            println!("cargo:rerun-if-changed={}", lib.display());
+            println!("cargo:rustc-link-search=native={}", out.display());
             println!("cargo:rustc-link-lib=static=opus");
             println!("cargo:rustc-cfg=has_opus");
             return;
